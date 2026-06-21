@@ -1,188 +1,318 @@
 -- Rake :: Stratum.u
--- Stratum v1 TCP/JSON-RPC transport layer.
--- This file now models a real newline-delimited message loop, request/response
--- ids, reconnect-aware socket state, and parsing helpers.
+-- Full Stratum v1 session: TCP connection, newline-delimited message framing,
+-- subscribe/authorize handshake, event loop, submit with response tracking.
+--
+-- Design principles:
+--   - Pure message parsing (StratumMsg.u / Json.u) is kept separate from IO
+--   - All pending requests are tracked by id so responses can be matched
+--   - clean_jobs=true triggers an abort signal to the mining loop
+--   - Every error path is named and logged, not silently swallowed
+--   - mining.set_extranonce is handled (pools can change nonce params mid-session)
 
-use Config.PoolEntry
+use Config (PoolEntry)
+use StratumMsg
+use Json
 
-type Socket = Socket Text
+-- -----------------------------------------------------------------------
+-- Session state
+-- -----------------------------------------------------------------------
 
-type JsonValue
-  = JNull
-  | JBool Boolean
-  | JNum Float
-  | JStr Text
-  | JArr [JsonValue]
-  | JObj [(Text, JsonValue)]
+type ConnState
+  = Connecting
+  | Subscribing
+  | Authorizing
+  | Mining
+  | Disconnected Text   -- reason
 
-type RpcMessage = {
-  id      : Optional Nat,
-  method  : Optional Text,
-  params  : Optional [JsonValue],
-  result  : Optional JsonValue,
-  error   : Optional JsonValue,
-  raw     : Text
+type PendingReq = {
+  id      : Nat,
+  method  : Text,
+  sentAt  : Nat    -- epoch millis for latency tracking
 }
 
-type StratumJob = {
-  jobId          : Text,
-  prevHash       : Bytes,
-  coinbase1      : Bytes,
-  coinbase2      : Bytes,
-  merkleBranches : [Bytes],
-  version        : Nat32,
-  nbits          : Nat32,
-  ntime          : Nat32,
-  cleanJobs      : Boolean
-}
-
-type StratumState = {
+type StratumSession = {
   socket          : Socket,
   pool            : PoolEntry,
+  connState       : ConnState,
   nextId          : Nat,
-  extraNonce1     : Bytes,
+  recvBuf         : Text,
+  extraNonce1     : Bytes,       -- decoded from hex
   extraNonce2Size : Nat,
   difficulty      : Float,
-  currentJob      : Optional StratumJob,
-  connected       : Boolean,
-  buffered        : Text
+  currentJob      : Optional NotifyParams,
+  pendingReqs     : [PendingReq],
+  sharesAccepted  : Nat,
+  sharesRejected  : Nat,
+  sessionStart    : Nat
 }
 
-Stratum.connect : PoolEntry -> '{IO, Exception} StratumState
-Stratum.connect entry = do
-  sock = tcpConnect entry.pool
-  sendLine sock (subscribeMsg 1 "Rake/0.1.0")
-  subLine = recvLine sock ""
-  sendLine sock (authorizeMsg 2 entry.wallet entry.worker entry.password)
-  authLine = recvLine sock ""
-  initialFromHandshake entry sock subLine authLine
+-- -----------------------------------------------------------------------
+-- Connect and perform full handshake
+-- -----------------------------------------------------------------------
 
-Stratum.readMessage : StratumState -> '{IO, Exception} (RpcMessage, StratumState)
-Stratum.readMessage state = do
-  line = recvLine state.socket state.buffered
-  let msg = parseRpc line
-  (msg, { state | buffered = "" })
-
-Stratum.eventLoop : StratumState -> '{IO, Exception} StratumState
-eventLoop state = do
-  (msg, state2) = Stratum.readMessage state
-  match msg.method with
-    Some "mining.set_difficulty" ->
-      let diff = parseDifficulty msg
-      eventLoop { state2 | difficulty = diff }
-    Some "mining.notify" ->
-      let job = parseJob msg
-      eventLoop { state2 | currentJob = Some job }
-    _ ->
-      eventLoop state2
-
-Stratum.submit : StratumState -> StratumJob -> Bytes -> '{IO, Exception} StratumState
-Stratum.submit state job nonce = do
-  let id = state.nextId
-  sendLine state.socket (submitMsg id state.pool.wallet state.pool.worker job.jobId nonce job.ntime)
-  pure { state | nextId = id + 1 }
-
-Stratum.disconnect : StratumState -> '{IO} ()
-Stratum.disconnect state =
-  tcpClose state.socket
-
-subscribeMsg : Nat -> Text -> Text
-subscribeMsg id agent =
-  "{" ++
-  "\"id\":" ++ Nat.toText id ++ "," ++
-  "\"method\":\"mining.subscribe\"," ++
-  "\"params\":[\"" ++ agent ++ "\"]" ++
-  "}"
-
-authorizeMsg : Nat -> Text -> Text -> Text -> Text
-authorizeMsg id wallet worker pass =
-  user = wallet ++ "." ++ worker
-  "{" ++
-  "\"id\":" ++ Nat.toText id ++ "," ++
-  "\"method\":\"mining.authorize\"," ++
-  "\"params\":[\"" ++ user ++ "\",\"" ++ pass ++ "\"]" ++
-  "}"
-
-submitMsg : Nat -> Text -> Text -> Text -> Bytes -> Nat32 -> Text
-submitMsg id wallet worker jobId nonce ntime =
-  user = wallet ++ "." ++ worker
-  nonceHex = Bytes.toHex nonce
-  timeHex = Nat32.toHex ntime
-  "{" ++
-  "\"id\":" ++ Nat.toText id ++ "," ++
-  "\"method\":\"mining.submit\"," ++
-  "\"params\":[\"" ++ user ++ "\",\"" ++ jobId ++ "\",\"" ++ nonceHex ++ "\",\"" ++ timeHex ++ "\"]" ++
-  "}"
-
-parseRpc : Text -> RpcMessage
-parseRpc raw =
-  -- Placeholder structural parser contract. Replace with real JSON decoder.
-  {
-    id = None,
-    method = parseMethod raw,
-    params = None,
-    result = None,
-    error = None,
-    raw = raw
-  }
-
-parseMethod : Text -> Optional Text
-parseMethod raw =
-  if Text.contains "\"mining.notify\"" raw then Some "mining.notify"
-  else if Text.contains "\"mining.set_difficulty\"" raw then Some "mining.set_difficulty"
-  else None
-
-parseDifficulty : RpcMessage -> Float
-parseDifficulty _ = 1.0
-
-parseJob : RpcMessage -> StratumJob
-parseJob _ = {
-  jobId = "",
-  prevHash = Bytes.empty,
-  coinbase1 = Bytes.empty,
-  coinbase2 = Bytes.empty,
-  merkleBranches = [],
-  version = 0,
-  nbits = 0,
-  ntime = 0,
-  cleanJobs = true
-}
-
-initialFromHandshake : PoolEntry -> Socket -> Text -> Text -> '{IO, Exception} StratumState
-initialFromHandshake entry sock _ _ =
-  pure {
-    socket = sock,
-    pool = entry,
-    nextId = 3,
-    extraNonce1 = Bytes.empty,
+Stratum.connect : PoolEntry -> '{IO, Exception} StratumSession
+Stratum.connect pool = do
+  IO.println ("[stratum] Connecting to " ++ pool.pool ++ "...")
+  sock  = tcpConnect pool.pool
+  now   = Time.epochMillis ()
+  state = {
+    socket          = sock,
+    pool            = pool,
+    connState       = Subscribing,
+    nextId          = 1,
+    recvBuf         = "",
+    extraNonce1     = Bytes.empty,
     extraNonce2Size = 4,
-    difficulty = 1.0,
-    currentJob = None,
-    connected = true,
-    buffered = ""
+    difficulty      = 1.0,
+    currentJob      = None,
+    pendingReqs     = [],
+    sharesAccepted  = 0,
+    sharesRejected  = 0,
+    sessionStart    = now
   }
 
-recvLine : Socket -> Text -> '{IO, Exception} Text
-recvLine sock carry = do
-  chunk = tcpRecv sock
-  assembled = carry ++ chunk
-  if Text.contains "\n" assembled then
-    pure (Text.takeWhile (\c -> c != ?\n) assembled)
-  else
-    recvLine sock assembled
+  -- Step 1: Subscribe
+  state1 = sendMsg state (Subscribe state.nextId "Rake/0.1.0" None)
+  subResp = recvUntilId state1 state1.nextId
+  state2  = handleSubscribeResponse state1 subResp
 
-sendLine : Socket -> Text -> '{IO, Exception} ()
-sendLine sock line =
-  tcpSend sock (line ++ "\n")
+  -- Step 2: Authorize
+  state3  = sendMsg state2 (Authorize state2.nextId pool.wallet pool.worker pool.password)
+  authResp = recvUntilId state3 state3.nextId
+  state4   = handleAuthorizeResponse state3 authResp
+
+  IO.println "[stratum] Handshake complete. Waiting for work..."
+  pure state4
+
+handleSubscribeResponse : StratumSession -> ServerMsg -> StratumSession
+handleSubscribeResponse state = cases
+  SubscribeOk _ sub ->
+    IO.println ("[stratum] Subscribed. ExtraNonce1=" ++ sub.extraNonce1 ++
+                " EN2Size=" ++ Nat.toText sub.extraNonce2Size)
+    { state
+      | extraNonce1     = Bytes.fromHex sub.extraNonce1
+      , extraNonce2Size = sub.extraNonce2Size
+      , connState       = Authorizing
+      , nextId          = state.nextId + 1
+    }
+  other ->
+    raise ("[stratum] Expected subscribe response, got: " ++ debugMsg other)
+
+handleAuthorizeResponse : StratumSession -> ServerMsg -> StratumSession
+handleAuthorizeResponse state = cases
+  AuthorizeOk _ true ->
+    IO.println "[stratum] Worker authorized."
+    { state | connState = Mining, nextId = state.nextId + 1 }
+  AuthorizeOk _ false ->
+    raise "[stratum] Authorization FAILED. Check wallet/worker/password."
+  other ->
+    raise ("[stratum] Expected authorize response, got: " ++ debugMsg other)
+
+-- -----------------------------------------------------------------------
+-- Message send
+-- -----------------------------------------------------------------------
+
+sendMsg : StratumSession -> ClientMsg -> '{IO, Exception} StratumSession
+sendMsg state msg = do
+  let line = ClientMsg.render msg
+  tcpSendLine state.socket line
+  let req = { id = extractId msg, method = extractMethod msg, sentAt = Time.epochMillis () }
+  pure { state | pendingReqs = state.pendingReqs ++ [req] }
+
+-- -----------------------------------------------------------------------
+-- Receive loop: read one newline-terminated JSON line
+-- -----------------------------------------------------------------------
+
+recvLine : StratumSession -> '{IO, Exception} (Text, StratumSession)
+recvLine state = do
+  match Text.indexOf "\n" state.recvBuf with
+    Some pos ->
+      let line  = Text.take pos state.recvBuf
+          rest  = Text.drop (pos + 1) state.recvBuf
+      pure (Text.trim line, { state | recvBuf = rest })
+    None ->
+      chunk = tcpRecv state.socket
+      recvLine { state | recvBuf = state.recvBuf ++ chunk }
+
+-- Parse one line and return a typed ServerMsg
+recvMsg : StratumSession -> '{IO, Exception} (ServerMsg, StratumSession)
+recvMsg state = do
+  (line, state2) = recvLine state
+  if Text.isEmpty line then recvMsg state2
+  else
+    match ServerMsg.parse line with
+      Left err ->
+        IO.println ("[stratum] Parse error: " ++ err ++ " | line: " ++ line)
+        recvMsg state2
+      Right msg ->
+        pure (msg, state2)
+
+-- Receive messages until we get one matching a specific request id
+recvUntilId : StratumSession -> Nat -> '{IO, Exception} (ServerMsg, StratumSession)
+recvUntilId state targetId = do
+  (msg, state2) = recvMsg state
+  match msgId msg with
+    Some n | n == targetId -> pure (msg, state2)
+    _                      ->
+      -- Handle any notifications that arrive before our response
+      state3 = applyNotification state2 msg
+      recvUntilId state3 targetId
+
+-- -----------------------------------------------------------------------
+-- Main event dispatch (called continuously from MinerLoop)
+-- -----------------------------------------------------------------------
+
+-- Read one message and apply it to session state.
+-- Returns (state, shouldAbortCurrentJob)
+Stratum.tick : StratumSession -> '{IO, Exception} (StratumSession, Boolean)
+Stratum.tick state = do
+  (msg, state2) = recvMsg state
+  match msg with
+    Notify params ->
+      IO.println ("[stratum] New job: " ++ params.jobId ++
+                  (if params.cleanJobs then " [CLEAN]" else ""))
+      let state3 = { state2 | currentJob = Some params }
+      pure (state3, params.cleanJobs)
+
+    SetDifficulty d ->
+      IO.println ("[stratum] Difficulty set to " ++ Float.toText d)
+      pure ({ state2 | difficulty = d }, false)
+
+    SetExtraNonce en1 en2sz ->
+      IO.println ("[stratum] ExtraNonce updated: " ++ en1)
+      pure ({
+        state2
+        | extraNonce1     = Bytes.fromHex en1
+        , extraNonce2Size = en2sz
+      }, false)
+
+    SubmitOk res ->
+      state3 = handleSubmitResult state2 res
+      pure (state3, false)
+
+    ShowMessage text ->
+      IO.println ("[stratum] Pool message: " ++ text)
+      pure (state2, false)
+
+    Reconnect host port wait ->
+      IO.println ("[stratum] Pool requesting reconnect to " ++ host ++ ":" ++ Nat.toText port ++
+                  " in " ++ Nat.toText wait ++ "s")
+      -- Signal MinerLoop to reconnect
+      raise ("reconnect:" ++ host ++ ":" ++ Nat.toText port)
+
+    GetVersion rid ->
+      -- Reply with our version string
+      state3 = sendVersionReply state2 rid
+      pure (state3, false)
+
+    AuthorizeOk _ _ ->
+      pure (state2, false)  -- late auth response, already handled
+
+    SubscribeOk _ _ ->
+      pure (state2, false)  -- late sub response, already handled
+
+    UnknownMsg raw ->
+      IO.println ("[stratum] Unrecognised message: " ++ Json.render raw)
+      pure (state2, false)
+
+-- -----------------------------------------------------------------------
+-- Share submission
+-- -----------------------------------------------------------------------
+
+Stratum.submitShare : StratumSession -> NotifyParams -> Bytes -> Bytes -> Nat32
+                   -> '{IO, Exception} StratumSession
+Stratum.submitShare state job nonce en2 ntime =
+  let worker  = state.pool.wallet ++ "." ++ state.pool.worker
+      en1Hex  = Bytes.toHex state.extraNonce1
+      en2Hex  = Bytes.toHex en2
+      ntimeHex = Nat32.toHex ntime
+      nonceHex = Bytes.toHex nonce
+  IO.println ("[stratum] Submitting share for job " ++ job.jobId ++
+              " nonce=" ++ nonceHex)
+  sendMsg state (Submit state.nextId worker job.jobId en2Hex ntimeHex nonceHex)
+
+handleSubmitResult : StratumSession -> SubmitResult -> StratumSession
+handleSubmitResult state res =
+  pending2 = List.filter (\r -> r.id != res.id) state.pendingReqs
+  match res.accepted with
+    true ->
+      IO.println "[stratum] Share ACCEPTED"
+      { state | sharesAccepted = state.sharesAccepted + 1, pendingReqs = pending2 }
+    false ->
+      errInfo = match (res.errCode, res.errMsg) with
+        (Some code, Some msg) -> " (" ++ Nat.toText code ++ ": " ++ msg ++ ")"
+        _                     -> ""
+      IO.println ("[stratum] Share REJECTED" ++ errInfo)
+      { state | sharesRejected = state.sharesRejected + 1, pendingReqs = pending2 }
+
+-- -----------------------------------------------------------------------
+-- Utility
+-- -----------------------------------------------------------------------
+
+applyNotification : StratumSession -> ServerMsg -> StratumSession
+applyNotification state = cases
+  SetDifficulty d      -> { state | difficulty = d }
+  SetExtraNonce en1 sz -> { state | extraNonce1 = Bytes.fromHex en1, extraNonce2Size = sz }
+  Notify p             -> { state | currentJob = Some p }
+  _                    -> state
+
+sendVersionReply : StratumSession -> Nat -> '{IO, Exception} StratumSession
+sendVersionReply state rid = do
+  let resp = Json.render (JObj
+        [ ("id",     JNum (Nat.toFloat rid))
+        , ("result", JStr "Rake/0.1.0")
+        , ("error",  JNull)
+        ])
+  tcpSendLine state.socket resp
+  pure state
+
+msgId : ServerMsg -> Optional Nat
+msgId = cases
+  SubscribeOk n _  -> Some n
+  AuthorizeOk n _  -> Some n
+  SubmitOk    r    -> Some r.id
+  GetVersion  n    -> Some n
+  _                -> None
+
+extractId : ClientMsg -> Nat
+extractId = cases
+  Subscribe        n _ _ -> n
+  Authorize        n _ _ -> n
+  Submit           n _ _ _ _ _ -> n
+  ExtraNonceSubscribe n  -> n
+  SuggestDifficulty   n _ -> n
+
+extractMethod : ClientMsg -> Text
+extractMethod = cases
+  Subscribe        _ _ _ -> "mining.subscribe"
+  Authorize        _ _ _ -> "mining.authorize"
+  Submit           _ _ _ _ _ _ -> "mining.submit"
+  ExtraNonceSubscribe _  -> "mining.extranonce.subscribe"
+  SuggestDifficulty   _ _ -> "mining.suggest_difficulty"
+
+debugMsg : ServerMsg -> Text
+debugMsg = cases
+  UnknownMsg j -> Json.render j
+  other        -> "(non-unknown server msg)"
+
+-- -----------------------------------------------------------------------
+-- TCP primitives (platform layer — replace with real IO bindings)
+-- -----------------------------------------------------------------------
+
+type Socket = Socket Text
 
 tcpConnect : Text -> '{IO, Exception} Socket
 tcpConnect endpoint = pure (Socket endpoint)
 
-tcpRecv : Socket -> '{IO, Exception} Text
-tcpRecv _ = pure ""
+tcpSendLine : Socket -> Text -> '{IO, Exception} ()
+tcpSendLine _ line =
+  -- Platform: write (line ++ "\n") to socket fd
+  pure ()
 
-tcpSend : Socket -> Text -> '{IO, Exception} ()
-tcpSend _ _ = pure ()
+tcpRecv : Socket -> '{IO, Exception} Text
+tcpRecv _ =
+  -- Platform: blocking read from socket fd, return as Text
+  pure ""
 
 tcpClose : Socket -> '{IO} ()
 tcpClose _ = pure ()

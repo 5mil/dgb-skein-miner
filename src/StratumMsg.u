@@ -1,0 +1,242 @@
+-- Rake :: StratumMsg.u
+-- Typed Stratum v1 message ADT.
+-- Each message variant carries exactly the fields the spec defines.
+-- Parsing from raw Json and rendering to Json live here.
+--
+-- Spec references:
+--   https://en.bitcoin.it/wiki/Stratum_mining_protocol
+--   https://github.com/bonesoul/CoiniumServ/wiki/Stratum-Protocol
+
+use Json
+
+-- -----------------------------------------------------------------------
+-- Outgoing (client -> pool)
+-- -----------------------------------------------------------------------
+
+type ClientMsg
+  -- mining.subscribe(agentVersion, optResumeSubId)
+  = Subscribe Nat Text (Optional Text)
+
+  -- mining.authorize(worker.wallet, password)
+  | Authorize Nat Text Text
+
+  -- mining.submit(workerName, jobId, extraNonce2, nTime, nonce)
+  | Submit Nat Text Text Text Text Text
+
+  -- mining.extranonce.subscribe()
+  | ExtraNonceSubscribe Nat
+
+  -- mining.suggest_difficulty(difficulty)
+  | SuggestDifficulty Nat Float
+
+ClientMsg.render : ClientMsg -> Text
+ClientMsg.render = cases
+  Subscribe id agent resumeId ->
+    params = [JStr agent] ++ (Optional.toList resumeId |> List.map JStr)
+    rpcRequest id "mining.subscribe" params
+
+  Authorize id worker pass ->
+    rpcRequest id "mining.authorize" [JStr worker, JStr pass]
+
+  Submit id worker jobId en2 ntime nonce ->
+    rpcRequest id "mining.submit" [JStr worker, JStr jobId, JStr en2, JStr ntime, JStr nonce]
+
+  ExtraNonceSubscribe id ->
+    rpcRequest id "mining.extranonce.subscribe" []
+
+  SuggestDifficulty id diff ->
+    rpcRequest id "mining.suggest_difficulty" [JNum diff]
+
+rpcRequest : Nat -> Text -> [Json] -> Text
+rpcRequest id method params =
+  Json.render (JObj
+    [ ("id",     JNum (Nat.toFloat id))
+    , ("method", JStr method)
+    , ("params", JArr params)
+    ])
+
+-- -----------------------------------------------------------------------
+-- Incoming (pool -> client)
+-- -----------------------------------------------------------------------
+
+type SubscribeResult = {
+  subscriptionIds : [(Text, Text)],  -- [(type, id)]
+  extraNonce1     : Text,            -- hex string
+  extraNonce2Size : Nat
+}
+
+type NotifyParams = {
+  jobId          : Text,
+  prevHash       : Text,   -- hex
+  coinbase1      : Text,   -- hex
+  coinbase2      : Text,   -- hex
+  merkleBranches : [Text], -- list of hex strings
+  version        : Text,   -- hex Nat32
+  nbits          : Text,   -- hex Nat32
+  ntime          : Text,   -- hex Nat32
+  cleanJobs      : Boolean
+}
+
+type SubmitResult = {
+  id       : Nat,
+  accepted : Boolean,
+  errCode  : Optional Nat,
+  errMsg   : Optional Text
+}
+
+type ServerMsg
+  = SubscribeOk  Nat SubscribeResult
+  | AuthorizeOk  Nat Boolean
+  | Notify       NotifyParams
+  | SetDifficulty Float
+  | SetExtraNonce Text Nat       -- (extraNonce1, extraNonce2Size)
+  | SubmitOk     SubmitResult
+  | ShowMessage  Text
+  | Reconnect    Text Nat Nat    -- (host, port, waitSecs)
+  | GetVersion   Nat             -- server asking client version
+  | UnknownMsg   Json            -- anything we don't recognise — kept for logging
+
+-- -----------------------------------------------------------------------
+-- Parse incoming JSON line into typed ServerMsg
+-- -----------------------------------------------------------------------
+
+ServerMsg.parse : Text -> Either Text ServerMsg
+ServerMsg.parse line =
+  match Json.parse line with
+    Left err  -> Left ("JSON parse error: " ++ jsonErrorText err)
+    Right obj ->
+      method  = Json.optField "method" obj
+      id      = Json.optField "id"     obj
+      result  = Json.optField "result" obj
+      errF    = Json.optField "error"  obj
+      params  = Json.optField "params" obj
+      parseServerMsg obj method id result errF params
+
+parseServerMsg : Json
+              -> Either Text (Optional Json)
+              -> Either Text (Optional Json)
+              -> Either Text (Optional Json)
+              -> Either Text (Optional Json)
+              -> Either Text (Optional Json)
+              -> Either Text ServerMsg
+parseServerMsg obj mMethod mId mResult mError mParams =
+  match mMethod with
+    -- Server notifications (no id)
+    Right (Some (JStr "mining.notify")) ->
+      match mParams with
+        Right (Some (JArr ps)) -> parseNotify ps
+        _ -> Left "mining.notify: missing or malformed params"
+
+    Right (Some (JStr "mining.set_difficulty")) ->
+      match mParams with
+        Right (Some (JArr [JNum d])) -> Right (SetDifficulty d)
+        _                            -> Left "mining.set_difficulty: expected [number]"
+
+    Right (Some (JStr "mining.set_extranonce")) ->
+      match mParams with
+        Right (Some (JArr [JStr en1, JNum sz])) ->
+          Right (SetExtraNonce en1 (Float.truncate sz))
+        _ -> Left "mining.set_extranonce: expected [string, number]"
+
+    Right (Some (JStr "client.show_message")) ->
+      match mParams with
+        Right (Some (JArr [JStr msg])) -> Right (ShowMessage msg)
+        _                              -> Left "client.show_message: expected [string]"
+
+    Right (Some (JStr "client.reconnect")) ->
+      match mParams with
+        Right (Some (JArr [JStr host, JNum port, JNum wait])) ->
+          Right (Reconnect host (Float.truncate port) (Float.truncate wait))
+        _ -> Left "client.reconnect: expected [string, number, number]"
+
+    Right (Some (JStr "client.get_version")) ->
+      match mId with
+        Right (Some (JNum n)) -> Right (GetVersion (Float.truncate n))
+        _                     -> Left "client.get_version: missing id"
+
+    -- Responses to our requests (have an id)
+    Right None ->
+      match mId with
+        Right (Some (JNum rid)) ->
+          let n = Float.truncate rid
+          parseResponse n mResult mError
+        _ -> Right (UnknownMsg obj)
+
+    Right (Some other) ->
+      Right (UnknownMsg obj)
+
+    Left err -> Left err
+
+parseResponse : Nat
+             -> Either Text (Optional Json)
+             -> Either Text (Optional Json)
+             -> Either Text ServerMsg
+parseResponse rid mResult mError =
+  match mResult with
+    -- Subscribe response: result = [[subs], extranonce1, en2size]
+    Right (Some (JArr [JArr subs, JStr en1, JNum en2sz])) ->
+      subIds = List.filterMap parseSubId subs
+      Right (SubscribeOk rid {
+        subscriptionIds = subIds,
+        extraNonce1     = en1,
+        extraNonce2Size = Float.truncate en2sz
+      })
+
+    -- Authorize response: result = true/false
+    Right (Some (JBool b)) ->
+      Right (AuthorizeOk rid b)
+
+    -- Submit response: result = true/false, possibly error array
+    Right (Some (JBool accepted)) ->
+      Right (SubmitOk {
+        id       = rid,
+        accepted = accepted,
+        errCode  = None,
+        errMsg   = None
+      })
+
+    -- Submit rejected with error details: {result: false, error: [code, msg, null]}
+    Right _ ->
+      match mError with
+        Right (Some (JArr [JNum code, JStr msg, _])) ->
+          Right (SubmitOk {
+            id       = rid,
+            accepted = false,
+            errCode  = Some (Float.truncate code),
+            errMsg   = Some msg
+          })
+        _ -> Right (UnknownMsg JNull)
+
+    Left err -> Left err
+
+parseNotify : [Json] -> Either Text ServerMsg
+parseNotify ps =
+  match ps with
+    [JStr jobId, JStr prevHash, JStr cb1, JStr cb2,
+     JArr branches, JStr ver, JStr nbits, JStr ntime,
+     JBool clean] ->
+      branchHex = List.filterMap (cases JStr s -> Some s; _ -> None) branches
+      Right (Notify {
+        jobId          = jobId,
+        prevHash       = prevHash,
+        coinbase1      = cb1,
+        coinbase2      = cb2,
+        merkleBranches = branchHex,
+        version        = ver,
+        nbits          = nbits,
+        ntime          = ntime,
+        cleanJobs      = clean
+      })
+    _ -> Left ("mining.notify: unexpected params count or types (got " ++
+               Nat.toText (List.size ps) ++ " params)")
+
+parseSubId : Json -> Optional (Text, Text)
+parseSubId = cases
+  JArr [JStr t, JStr i] -> Some (t, i)
+  _                     -> None
+
+jsonErrorText : JsonError -> Text
+jsonErrorText = cases
+  UnexpectedChar _ pos -> "unexpected char at position " ++ Nat.toText pos
+  UnexpectedEnd  _     -> "unexpected end of input"
+  TypeMismatch exp got -> "expected " ++ exp ++ ", got " ++ got

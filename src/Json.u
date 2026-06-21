@@ -1,0 +1,226 @@
+-- Rake :: Json.u
+-- Minimal JSON parser for Stratum line messages.
+-- Handles the exact subset Stratum v1 uses:
+--   objects, arrays, strings, numbers, booleans, null.
+-- All values are typed. Partial / malformed JSON returns JsonError.
+--
+-- Design: pure function, no IO, fully testable without network.
+
+type Json
+  = JNull
+  | JBool  Boolean
+  | JNum   Float
+  | JStr   Text
+  | JArr   [Json]
+  | JObj   [(Text, Json)]
+
+type JsonError
+  = UnexpectedChar Text Nat   -- (input, position)
+  | UnexpectedEnd  Text       -- (input)
+  | TypeMismatch   Text Text  -- (expected, got)
+
+-- -----------------------------------------------------------------------
+-- Public API
+-- -----------------------------------------------------------------------
+
+-- Parse a complete JSON value from a Text line.
+-- Returns Left JsonError on any parse failure.
+Json.parse : Text -> Either JsonError Json
+Json.parse input =
+  match parseValue (Text.toCharList input) 0 with
+    Right (v, _) -> Right v
+    Left  err    -> Left err
+
+-- Extract a field from a JObj by key
+Json.field : Text -> Json -> Either JsonError Json
+Json.field key = cases
+  JObj pairs ->
+    match List.find (\(k, _) -> k == key) pairs with
+      Some (_, v) -> Right v
+      None        -> Left (TypeMismatch ("field '" ++ key ++ "'") "absent")
+  other -> Left (TypeMismatch "object" (jsonTypeName other))
+
+-- Extract a string value
+Json.asText : Json -> Either JsonError Text
+Json.asText = cases
+  JStr s -> Right s
+  other  -> Left (TypeMismatch "string" (jsonTypeName other))
+
+-- Extract a number as Float
+Json.asFloat : Json -> Either JsonError Float
+Json.asFloat = cases
+  JNum n -> Right n
+  other  -> Left (TypeMismatch "number" (jsonTypeName other))
+
+-- Extract a number as Nat (truncates)
+Json.asNat : Json -> Either JsonError Nat
+Json.asNat = cases
+  JNum n -> Right (Float.truncate n)
+  other  -> Left (TypeMismatch "number" (jsonTypeName other))
+
+-- Extract a boolean
+Json.asBool : Json -> Either JsonError Boolean
+Json.asBool = cases
+  JBool b -> Right b
+  other   -> Left (TypeMismatch "boolean" (jsonTypeName other))
+
+-- Extract an array
+Json.asArr : Json -> Either JsonError [Json]
+Json.asArr = cases
+  JArr xs -> Right xs
+  other   -> Left (TypeMismatch "array" (jsonTypeName other))
+
+-- Extract optional field (None if absent, Left on type error)
+Json.optField : Text -> Json -> Either JsonError (Optional Json)
+Json.optField key obj =
+  match Json.field key obj with
+    Right v                        -> Right (Some v)
+    Left (TypeMismatch _ "absent") -> Right None
+    Left err                       -> Left err
+
+-- -----------------------------------------------------------------------
+-- Serialization helpers (for building outgoing Stratum messages)
+-- -----------------------------------------------------------------------
+
+Json.render : Json -> Text
+Json.render = cases
+  JNull      -> "null"
+  JBool true -> "true"
+  JBool _    -> "false"
+  JNum  n    -> Float.toText n
+  JStr  s    -> "\"" ++ escapeStr s ++ "\""
+  JArr  xs   -> "[" ++ Text.join "," (List.map Json.render xs) ++ "]"
+  JObj  ps   -> "{" ++ Text.join "," (List.map renderPair ps) ++ "}"
+
+renderPair : (Text, Json) -> Text
+renderPair (k, v) = "\"" ++ escapeStr k ++ "\"" ++ ":" ++ Json.render v
+
+escapeStr : Text -> Text
+escapeStr s =
+  Text.toCharList s
+    |> List.flatMap escapeChar
+    |> Text.fromCharList
+
+escapeChar : Char -> [Char]
+escapeChar = cases
+  ?\"  -> [?\\ , ?\"]
+  ?\\  -> [?\\ , ?\\]
+  ?\n  -> [?\\ , ?n]
+  ?\r  -> [?\\ , ?r]
+  ?\t  -> [?\\ , ?t]
+  c    -> [c]
+
+-- -----------------------------------------------------------------------
+-- Internal parser
+-- -----------------------------------------------------------------------
+
+type ParseResult a = (a, Nat)  -- (value, next position)
+
+parseValue : [Char] -> Nat -> Either JsonError (Json, Nat)
+parseValue cs pos =
+  match skipWhitespace cs pos with
+    p ->
+      match List.at cs p with
+        None        -> Left (UnexpectedEnd (Text.fromCharList cs))
+        Some ?{     -> parseObject cs (p + 1)
+        Some ?[     -> parseArray  cs (p + 1)
+        Some ?\"    -> parseString cs (p + 1)
+        Some ?t     -> parseLiteral cs p "true"  (JBool true)
+        Some ?f     -> parseLiteral cs p "false" (JBool false)
+        Some ?n     -> parseLiteral cs p "null"  JNull
+        Some c ->
+          if isDigit c || c == ?- then parseNumber cs p
+          else Left (UnexpectedChar (Text.fromCharList cs) p)
+
+parseLiteral : [Char] -> Nat -> Text -> Json -> Either JsonError (Json, Nat)
+parseLiteral cs pos literal value =
+  lit = Text.toCharList literal
+  end = pos + List.size lit
+  slice = List.slice pos end cs
+  if slice == lit then Right (value, end)
+  else Left (UnexpectedChar (Text.fromCharList cs) pos)
+
+parseString : [Char] -> Nat -> Either JsonError (Json, Nat)
+parseString cs pos =
+  go : Nat -> [Char] -> Either JsonError (Json, Nat)
+  go p acc =
+    match List.at cs p with
+      None        -> Left (UnexpectedEnd (Text.fromCharList cs))
+      Some ?\"    -> Right (JStr (Text.fromCharList (List.reverse acc)), p + 1)
+      Some ?\\ ->
+        match List.at cs (p + 1) with
+          None    -> Left (UnexpectedEnd (Text.fromCharList cs))
+          Some ?" -> go (p + 2) (?" +: acc)
+          Some ?\\ -> go (p + 2) (?\\ +: acc)
+          Some ?n -> go (p + 2) (?\n +: acc)
+          Some ?r -> go (p + 2) (?\r +: acc)
+          Some ?t -> go (p + 2) (?\t +: acc)
+          Some c  -> go (p + 2) (c +: acc)
+      Some c -> go (p + 1) (c +: acc)
+  go pos []
+
+parseNumber : [Char] -> Nat -> Either JsonError (Json, Nat)
+parseNumber cs pos =
+  end = List.findIndex (\c -> not (isDigit c || c == ?- || c == ?. || c == ?e || c == ?E || c == ?+)) cs pos
+        |> Optional.getOrElse (List.size cs)
+  numStr = Text.fromCharList (List.slice pos end cs)
+  match Float.fromText numStr with
+    Some n -> Right (JNum n, end)
+    None   -> Left (UnexpectedChar (Text.fromCharList cs) pos)
+
+parseObject : [Char] -> Nat -> Either JsonError (Json, Nat)
+parseObject cs pos =
+  go : Nat -> [(Text, Json)] -> Either JsonError (Json, Nat)
+  go p acc =
+    let p2 = skipWhitespace cs p
+    match List.at cs p2 with
+      None    -> Left (UnexpectedEnd (Text.fromCharList cs))
+      Some ?} -> Right (JObj (List.reverse acc), p2 + 1)
+      Some ?, -> go (p2 + 1) acc
+      Some ?\" ->
+        match parseString cs (p2 + 1) with
+          Left err -> Left err
+          Right (JStr key, p3) ->
+            let p4 = skipWhitespace cs p3
+            match List.at cs p4 with
+              Some ?: ->
+                match parseValue cs (p4 + 1) with
+                  Left err       -> Left err
+                  Right (v, p5) -> go p5 ((key, v) +: acc)
+              _ -> Left (UnexpectedChar (Text.fromCharList cs) p4)
+          Right _ -> Left (UnexpectedChar (Text.fromCharList cs) p2)
+      Some _ -> Left (UnexpectedChar (Text.fromCharList cs) p2)
+  go pos []
+
+parseArray : [Char] -> Nat -> Either JsonError (Json, Nat)
+parseArray cs pos =
+  go : Nat -> [Json] -> Either JsonError (Json, Nat)
+  go p acc =
+    let p2 = skipWhitespace cs p
+    match List.at cs p2 with
+      None    -> Left (UnexpectedEnd (Text.fromCharList cs))
+      Some ?] -> Right (JArr (List.reverse acc), p2 + 1)
+      Some ?, -> go (p2 + 1) acc
+      _       ->
+        match parseValue cs p2 with
+          Left err      -> Left err
+          Right (v, p3) -> go p3 (v +: acc)
+  go pos []
+
+skipWhitespace : [Char] -> Nat -> Nat
+skipWhitespace cs pos =
+  match List.at cs pos with
+    Some c | c == ?  || c == ?\n || c == ?\r || c == ?\t -> skipWhitespace cs (pos + 1)
+    _ -> pos
+
+isDigit : Char -> Boolean
+isDigit c = c >= ?0 && c <= ?9
+
+jsonTypeName : Json -> Text
+jsonTypeName = cases
+  JNull   -> "null"
+  JBool _ -> "boolean"
+  JNum  _ -> "number"
+  JStr  _ -> "string"
+  JArr  _ -> "array"
+  JObj  _ -> "object"
