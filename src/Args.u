@@ -1,0 +1,187 @@
+-- Rake :: Args.u
+-- Full CLI argument parser with SRBMiner-compatible flag names.
+-- Handles: value flags, boolean flags, unknown flags, --help, --version.
+
+type ArgError
+  = MissingValue Text        -- flag given but no value follows
+  | UnknownFlag  Text        -- unrecognised flag
+  | InvalidValue Text Text   -- flag, bad value
+  | MissingRequired Text     -- required flag absent entirely
+
+type ParsedArgs = {
+  algorithm   : Optional Text,
+  pool        : Optional Text,
+  wallet      : Optional Text,
+  worker      : Optional Text,
+  password    : Optional Text,
+  tls         : Optional Boolean,
+  cpuThreads  : Optional Nat,
+  disableGpu  : Boolean,
+  disableCpu  : Boolean,
+  configFile  : Optional Text,
+  poolsFile   : Optional Text,
+  logFile     : Optional Text,
+  apiPort     : Optional Nat,
+  background  : Boolean,
+  showHelp    : Boolean,
+  showVersion : Boolean
+}
+
+-- All recognised flags
+valueFlagNames : [Text]
+valueFlagNames =
+  [ "--algorithm", "--algo"
+  , "--pool", "--url"
+  , "--wallet", "--user"
+  , "--worker"
+  , "--password", "--pass"
+  , "--cpu-threads"
+  , "--config-file", "--config"
+  , "--pools-file"
+  , "--log-file"
+  , "--api-port"
+  , "--tls"
+  ]
+
+boolFlagNames : [Text]
+boolFlagNames =
+  [ "--disable-gpu"
+  , "--disable-cpu"
+  , "--background", "--bg"
+  , "--help", "-h"
+  , "--version", "-v"
+  ]
+
+-- Empty defaults
+defaultArgs : ParsedArgs
+defaultArgs = {
+  algorithm   = None,
+  pool        = None,
+  wallet      = None,
+  worker      = None,
+  password    = None,
+  tls         = None,
+  cpuThreads  = None,
+  disableGpu  = false,
+  disableCpu  = false,
+  configFile  = None,
+  poolsFile   = None,
+  logFile     = None,
+  apiPort     = None,
+  background  = false,
+  showHelp    = false,
+  showVersion = false
+}
+
+-- Entry: parse a raw [Text] argv into ParsedArgs or a list of errors
+Args.parse : [Text] -> Either [ArgError] ParsedArgs
+Args.parse argv =
+  go : [Text] -> ParsedArgs -> [ArgError] -> Either [ArgError] ParsedArgs
+  go = cases
+    -- done
+    [], acc, [] -> Right acc
+    [], _,  errs -> Left errs
+
+    -- boolean flags
+    flag +: rest, acc, errs | List.contains flag boolFlagNames ->
+      go rest (applyBoolFlag flag acc) errs
+
+    -- value flags: need a following token
+    flag +: rest, acc, errs | List.contains flag valueFlagNames ->
+      match rest with
+        []           -> go [] acc (errs ++ [MissingValue flag])
+        val +: rest2 ->
+          match applyValueFlag flag val acc with
+            Right acc2  -> go rest2 acc2 errs
+            Left err    -> go rest2 acc (errs ++ [err])
+
+    -- unknown
+    flag +: rest, acc, errs ->
+      go rest acc (errs ++ [UnknownFlag flag])
+
+  go argv defaultArgs []
+
+-- Apply a boolean flag to the accumulator
+applyBoolFlag : Text -> ParsedArgs -> ParsedArgs
+applyBoolFlag flag acc =
+  match flag with
+    "--disable-gpu"          -> { acc | disableGpu  = true }
+    "--disable-cpu"          -> { acc | disableCpu  = true }
+    "--background" | "--bg" -> { acc | background  = true }
+    "--help"       | "-h"  -> { acc | showHelp    = true }
+    "--version"    | "-v"  -> { acc | showVersion = true }
+    _                        -> acc
+
+-- Apply a value flag to the accumulator, returning ArgError on bad parse
+applyValueFlag : Text -> Text -> ParsedArgs -> Either ArgError ParsedArgs
+applyValueFlag flag val acc =
+  match flag with
+    "--algorithm" | "--algo" ->
+      Right { acc | algorithm = Some (Text.toLowercase val) }
+    "--pool" | "--url" ->
+      Right { acc | pool = Some val }
+    "--wallet" | "--user" ->
+      Right { acc | wallet = Some val }
+    "--worker" ->
+      Right { acc | worker = Some val }
+    "--password" | "--pass" ->
+      Right { acc | password = Some val }
+    "--config-file" | "--config" ->
+      Right { acc | configFile = Some val }
+    "--pools-file" ->
+      Right { acc | poolsFile = Some val }
+    "--log-file" ->
+      Right { acc | logFile = Some val }
+    "--tls" ->
+      match Text.toLowercase val with
+        "true"  | "1" | "yes" -> Right { acc | tls = Some true }
+        "false" | "0" | "no"  -> Right { acc | tls = Some false }
+        _                      -> Left (InvalidValue flag val)
+    "--cpu-threads" ->
+      match Nat.fromText val with
+        Some n -> Right { acc | cpuThreads = Some n }
+        None   -> Left (InvalidValue flag val)
+    "--api-port" ->
+      match Nat.fromText val with
+        Some n -> Right { acc | apiPort = Some n }
+        None   -> Left (InvalidValue flag val)
+    _ -> Right acc
+
+-- Render errors to human-readable lines
+Args.renderErrors : [ArgError] -> [Text]
+Args.renderErrors = List.map cases
+  MissingValue flag    -> "[error] Flag '" ++ flag ++ "' requires a value"
+  UnknownFlag  flag    -> "[error] Unknown flag: '" ++ flag ++ "'"
+  InvalidValue f v     -> "[error] Invalid value '" ++ v ++ "' for flag '" ++ f ++ "'"
+  MissingRequired flag -> "[error] Required flag missing: '" ++ flag ++ "'"
+
+-- Help text (mirrors SRBMiner --help style)
+Args.helpText : Text
+Args.helpText = """
+Rake — DigiByte Skein miner (SRBMiner-compatible)
+
+Usage:
+  miner [options]
+
+Options:
+  --algorithm, --algo       Hash algorithm to use           [default: skein]
+  --pool, --url             Stratum pool URL                [required]
+  --wallet, --user          Wallet/user address             [required]
+  --worker                  Worker name                     [default: rig0]
+  --password, --pass        Pool password                   [default: x]
+  --tls                     Enable TLS (true/false)         [default: false]
+  --cpu-threads             Number of CPU threads           [default: auto]
+  --disable-gpu             Disable GPU mining
+  --disable-cpu             Disable CPU mining
+  --config-file, --config   Path to JSON config file        [default: config.json]
+  --pools-file              Path to failover pools file     [default: pools.json]
+  --log-file                Path to log output file
+  --api-port                Enable stats HTTP API on port
+  --background, --bg        Run as background process
+  --help, -h                Show this help
+  --version, -v             Show version
+
+Example:
+  miner --algorithm skein --pool stratum+tcp://sgb.mining-dutch.nl:3032 \\
+        --wallet 5mil --worker 5mil.worker55 --password x
+"""

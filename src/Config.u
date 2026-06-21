@@ -1,52 +1,102 @@
--- dgb-skein-miner :: Config.u
--- Resolves config from CLI flags and optional config.json / pools.json files.
--- CLI flags take precedence over file values.
+-- Rake :: Config.u
+-- Resolves final Config from parsed CLI args + JSON config/pools files.
+-- Precedence: CLI flags > config.json > built-in defaults.
+
+use Args (ParsedArgs)
 
 type Algorithm = Skein
 
-type PoolEntry = { pool : Text, wallet : Text, worker : Text, password : Text }
-
-type Config = {
-  algorithm   : Algorithm,
-  pools       : [PoolEntry],
-  cpuThreads  : Optional Nat,
-  disableGpu  : Boolean,
-  disableCpu  : Boolean,
-  tls         : Boolean,
-  logFile     : Optional Text,
-  apiPort     : Optional Nat,
-  background  : Boolean
+type PoolEntry = {
+  pool     : Text,
+  wallet   : Text,
+  worker   : Text,
+  password : Text
 }
 
--- Parses flags like SRBMiner:
---   --algorithm skein
---   --pool stratum+tcp://host:port
---   --wallet ADDR
---   --worker rig1
---   --password x
---   --cpu-threads 4
---   --tls true
---   --config-file config.json
---   --pools-file pools.json
---   --background
---   --log-file miner.log
---   --api-port 8080
-Config.load : [Text] -> Config
-Config.load args =
-  filePath  = flagValue args "--config-file" |> Optional.getOrElse "config.json"
-  poolsPath = flagValue args "--pools-file"  |> Optional.getOrElse "pools.json"
-  fileCfg   = JSON.parseFile filePath
-  filePool  = JSON.parseFile poolsPath
-  merge fileCfg filePool args
+type Config = {
+  algorithm  : Algorithm,
+  pools      : [PoolEntry],
+  cpuThreads : Optional Nat,
+  disableGpu : Boolean,
+  disableCpu : Boolean,
+  tls        : Boolean,
+  logFile    : Optional Text,
+  apiPort    : Optional Nat,
+  background : Boolean
+}
 
--- Helper: extract value after a named flag
-flagValue : [Text] -> Text -> Optional Text
-flagValue args flag =
-  go : [Text] -> Optional Text
-  go = cases
-    []        -> None
-    [_]       -> None
-    k +: v +: rest ->
-      if k == flag then Some v
-      else go (v +: rest)
-  go args
+-- Default pool entry using prefilled credentials
+defaultPool : PoolEntry
+defaultPool = {
+  pool     = "stratum+tcp://sgb.mining-dutch.nl:3032",
+  wallet   = "5mil",
+  worker   = "5mil.worker55",
+  password = "x"
+}
+
+-- Build Config from ParsedArgs, merging config file values underneath
+Config.fromParsed : ParsedArgs -> Config
+Config.fromParsed parsed =
+  -- Load JSON config file if specified (or default config.json)
+  cfgPath  = Optional.getOrElse "config.json" parsed.configFile
+  fileCfg  = JSON.readFileSafe cfgPath
+
+  -- Pool from CLI or file or default
+  pool = {
+    pool     = parsed.pool     |> orFile fileCfg "pool"     |> Optional.getOrElse defaultPool.pool,
+    wallet   = parsed.wallet   |> orFile fileCfg "wallet"   |> Optional.getOrElse defaultPool.wallet,
+    worker   = parsed.worker   |> orFile fileCfg "worker"   |> Optional.getOrElse defaultPool.worker,
+    password = parsed.password |> orFile fileCfg "password" |> Optional.getOrElse defaultPool.password
+  }
+
+  -- Failover pools from --pools-file (or pools.json)
+  poolsPath    = parsed.poolsFile |> Optional.getOrElse "pools.json"
+  extraPools   = JSON.readPoolsFileSafe poolsPath
+  allPools     = [pool] ++ extraPools
+
+  {
+    algorithm  = parseAlgo (parsed.algorithm |> orFile fileCfg "algorithm" |> Optional.getOrElse "skein"),
+    pools      = allPools,
+    cpuThreads = parsed.cpuThreads |> orFileNat fileCfg "cpu-threads",
+    disableGpu = parsed.disableGpu,
+    disableCpu = parsed.disableCpu,
+    tls        = parsed.tls |> orFileBool fileCfg "tls" |> Optional.getOrElse false,
+    logFile    = parsed.logFile |> orFile fileCfg "log-file",
+    apiPort    = parsed.apiPort |> orFileNat fileCfg "api-port",
+    background = parsed.background
+  }
+
+-- Validate required fields, return Left with missing field name on failure
+Config.validate : Config -> Either Text Config
+Config.validate cfg =
+  match cfg.pools with
+    [] -> Left "pool (no pool entries found)"
+    (p +: _) ->
+      if Text.isEmpty p.pool   then Left "--pool"
+      else if Text.isEmpty p.wallet then Left "--wallet"
+      else Right cfg
+
+-- Parse algorithm name to ADT
+parseAlgo : Text -> Algorithm
+parseAlgo = cases
+  "skein" -> Skein
+  _       -> Skein   -- default to Skein; extend for future algorithms
+
+-- Helpers: prefer CLI Optional, fall back to JSON file value
+orFile : Optional (Map Text JSON) -> Text -> Optional Text -> Optional Text
+orFile file key cli =
+  match cli with
+    Some v -> Some v
+    None   -> file |> Optional.flatMap (Map.lookup key) |> Optional.flatMap JSON.asText
+
+orFileBool : Optional (Map Text JSON) -> Text -> Optional Boolean -> Optional Boolean
+orFileBool file key cli =
+  match cli with
+    Some v -> Some v
+    None   -> file |> Optional.flatMap (Map.lookup key) |> Optional.flatMap JSON.asBool
+
+orFileNat : Optional (Map Text JSON) -> Text -> Optional Nat -> Optional Nat
+orFileNat file key cli =
+  match cli with
+    Some v -> Some v
+    None   -> file |> Optional.flatMap (Map.lookup key) |> Optional.flatMap JSON.asNat

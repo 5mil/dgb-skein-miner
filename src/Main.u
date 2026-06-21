@@ -1,13 +1,37 @@
--- dgb-skein-miner :: Main.u
--- Entry point. Parses CLI flags, loads config, and starts the miner loop.
+-- Rake :: Main.u
+-- Entry point: parse CLI args, load config, start miner.
 
+use Args
 use Config
 use MinerLoop
 use Stats
 
+version : Text
+version = "Rake/0.1.0 (dgb-skein)"
+
 main : '{IO, Exception} ()
 main = do
-  args    = CLI.args ()
-  cfg     = Config.load args
-  _       = Stats.init cfg
-  MinerLoop.start cfg
+  argv = IO.getArgs ()
+
+  -- Handle --help / --version before full parse
+  if List.contains "--help" argv || List.contains "-h" argv then
+    IO.println Args.helpText
+  else if List.contains "--version" argv || List.contains "-v" argv then
+    IO.println version
+  else
+    match Args.parse argv with
+      Left errs ->
+        -- Print all errors then show usage hint
+        List.each (Args.renderErrors errs) IO.println
+        IO.println "\nRun with --help for usage."
+        IO.exit 1
+      Right parsed ->
+        cfg = Config.fromParsed parsed
+        match Config.validate cfg with
+          Left missing ->
+            IO.println ("[rake] Missing required config: " ++ missing)
+            IO.println "Run with --help for usage."
+            IO.exit 1
+          Right validCfg ->
+            _ = Stats.init validCfg
+            MinerLoop.start validCfg
