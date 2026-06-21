@@ -1,124 +1,229 @@
--- dgb-skein-miner :: Hash/Skein.u
+-- Rake :: Hash/Skein.u
 -- Pure Unison Skein-512 implementation.
--- Based on the Skein 1.3 specification (Threefish-512 + UBI chaining).
 --
--- Reference: https://www.schneier.com/academic/skein/
+-- PERMANENT REGRESSION REFERENCE — do not optimize or inline.
+-- This file exists to give the native C backend a second independent
+-- implementation to compare against. If they ever produce different output
+-- for any input, something is wrong with one of them.
+--
+-- Based on: The Skein Hash Function Family, Version 1.3
+-- https://www.schneier.com/academic/skein/
+-- Specifically: Section 2 (Threefish), Section 3 (UBI), Section 4 (Skein)
 
-use Bytes
+use Hash.Vectors (skein512Vectors, runVectors, formatFailure)
 
--- Block / state sizes
-BlockSize   : Nat
-BlockSize   = 64  -- 512 bits / 8
+-- -----------------------------------------------------------------------
+-- Constants
+-- -----------------------------------------------------------------------
 
-StateWords  : Nat
-StateWords  = 8   -- 8 x 64-bit words
+blockBytes : Nat
+blockBytes = 64
 
--- Threefish-512 rotation constants (from Skein 1.3 spec)
+stateWords : Nat
+stateWords = 8
+
+-- Skein constant C240 (parity constant for key schedule)
+c240 : Nat64
+c240 = 0x5555555555555555
+
+-- Rotation constants for Skein-512 (Spec Table 4, 8 rows x 4 columns)
 rotConsts : [[Nat]]
-rotConsts = [
-  [46, 36, 19, 37],
-  [33, 27, 14, 42],
-  [17, 49, 36, 39],
-  [44,  9, 54, 56]
-]
+rotConsts =
+  [ [46, 36, 19, 37]
+  , [33, 27, 14, 42]
+  , [17, 49, 36, 39]
+  , [44,  9, 54, 56]
+  , [39, 30, 34, 24]
+  , [13, 50, 10, 17]
+  , [25, 29, 39, 43]
+  , [ 8, 35, 56, 22]
+  ]
 
--- UBI tweak type values
-Tweak_Config : Nat64
-Tweak_Config = 0x4C00000000000000
+-- Tweak type constants (top byte of T[1])
+tweak_CFG : Nat64
+tweak_CFG = 0x4C00000000000000
 
-Tweak_Message : Nat64
-Tweak_Message = 0x7000000000000000
+tweak_MSG : Nat64
+tweak_MSG = 0x7000000000000000
 
-Tweak_Out : Nat64
-Tweak_Out = 0x6300000000000000
+tweak_OUT : Nat64
+tweak_OUT = 0x6300000000000000
 
--- Main entry: hash any Bytes input, output 512-bit (64-byte) digest
+flag_FIRST : Nat64
+flag_FIRST = 0x4000000000000000
+
+flag_FINAL : Nat64
+flag_FINAL = 0x8000000000000000
+
+-- -----------------------------------------------------------------------
+-- Public API
+-- -----------------------------------------------------------------------
+
+-- Hash any input to a 64-byte Skein-512 digest
 hash512 : Bytes -> Bytes
 hash512 msg =
-  cfg    = initConfig 512
-  after1 = ubiCompress cfg Tweak_Config (skeinConfigBlock 512)
-  after2 = ubiCompress after1 Tweak_Message msg
-  output after2
+  iv    = List.replicate stateWords (0 : Nat64)
+  after_cfg = ubiCompress iv (flag_FIRST || flag_FINAL || tweak_CFG)
+                             (Nat.fromNat64 blockBytes) (configBlock 512)
+  after_msg = ubiCompressMsg after_cfg msg
+  outputTransform after_msg
 
--- Build the Skein configuration block (32 bytes for output length)
-skeinConfigBlock : Nat -> Bytes
-skeinConfigBlock outBits =
-  -- Schema ID: 0x53484152 ("SHAR"), version 1, output length in bits
-  magic   = Bytes.fromList [0x53, 0x48, 0x41, 0x52, 0x44, 0x00, 0x01, 0x00]
-  outLen  = Nat64.toBytes (Nat.toNat64 outBits)
-  Bytes.++ magic outLen ++ Bytes.replicate 16 0x00
+-- -----------------------------------------------------------------------
+-- Self-check: run all vectors from Vectors.u, hard-abort on any failure
+-- -----------------------------------------------------------------------
 
--- Initialize state to all zeros (IV)
-initConfig : Nat -> [Nat64]
-initConfig _ = List.replicate StateWords 0
+hash512_selfcheck : '{IO, Exception} ()
+hash512_selfcheck = do
+  failures = runVectors hash512 skein512Vectors
+  match failures with
+    [] ->
+      IO.println "[rake/pure] All Skein-1.3 vectors passed (pure Unison reference)."
+    _  ->
+      List.each failures (\f -> IO.println (formatFailure f))
+      raise "[rake/pure] FATAL: Pure Unison Skein-512 failed test vectors. Aborting."
 
--- UBI compression with arbitrary-length message
-ubiCompress : [Nat64] -> Nat64 -> Bytes -> [Nat64]
-ubiCompress state tweakType msg =
-  blocks = padAndSplit msg BlockSize
-  foldl (\st (i, blk) ->
-    let tweak = buildTweak tweakType i (Bytes.size msg)
-    threefishEncrypt st blk tweak
+-- -----------------------------------------------------------------------
+-- Skein configuration block (Spec Section 4.2)
+-- -----------------------------------------------------------------------
+
+configBlock : Nat -> Bytes
+configBlock outBits =
+  -- Schema ID: 0x53484152 = "SHAR" (little-endian), version 1
+  schemaVersion = 0x0000000133414853 : Nat64
+  outLen        = Nat.toNat64 outBits
+  -- 32-byte block: schema+version (8), output length (8), rest zeros
+  Bytes.fromNat64LE schemaVersion ++
+  Bytes.fromNat64LE outLen        ++
+  Bytes.replicate 16 0x00
+
+-- -----------------------------------------------------------------------
+-- UBI Chaining (Spec Section 3)
+-- -----------------------------------------------------------------------
+
+-- Full UBI compress for an arbitrary-length message
+ubiCompressMsg : [Nat64] -> Bytes -> [Nat64]
+ubiCompressMsg state msg =
+  blocks = padToBlocks msg blockBytes
+  total  = Bytes.size msg
+  List.foldl (\(st, (i, blk)) ->
+    let bytesDone = Nat.min ((i + 1) * blockBytes) total
+        isFirst   = (i == 0)
+        isLast    = (i == List.size blocks - 1)
+        tweak1    = buildTweak1 tweak_MSG isFirst isLast bytesDone
+    threefishEnc st blk tweak1
   ) state (List.indexed blocks)
 
--- Threefish-512 block cipher
-threefishEncrypt : [Nat64] -> Bytes -> (Nat64, Nat64) -> [Nat64]
-threefishEncrypt key block tweak =
-  words = Bytes.toNat64List block
-  kw    = expandKey key tweak
-  -- 72 rounds of mixing
-  result = foldl (\ws round ->
-    mix ws (rotConsts |> List.at (round `mod` 4) |> Optional.getOrElse [])
-    |> addKey kw (round / 4)
-  ) words (List.range 0 72)
-  -- Feed-forward XOR with input
+-- Single-block UBI compress (used for Config and Output blocks)
+ubiCompress : [Nat64] -> Nat64 -> Nat -> Bytes -> [Nat64]
+ubiCompress state tweak1 byteCnt block =
+  threefishEnc state block tweak1
+
+buildTweak1 : Nat64 -> Boolean -> Boolean -> Nat -> Nat64
+buildTweak1 typeField isFirst isLast bytesDone =
+  base  = typeField || Nat64.fromNat bytesDone
+  withF = if isFirst then base || flag_FIRST else base
+  if isLast  then withF || flag_FINAL else withF
+
+-- -----------------------------------------------------------------------
+-- Threefish-512 block cipher (Spec Section 2)
+-- -----------------------------------------------------------------------
+
+threefishEnc : [Nat64] -> Bytes -> Nat64 -> [Nat64]
+threefishEnc key block tweak1 =
+  let tweak0  = 0 : Nat64
+      tweak2  = Nat64.xor tweak0 tweak1
+      tweaks  = [tweak0, tweak1, tweak2]
+      words   = Bytes.toNat64ListLE block
+      extKey  = expandKey key tweaks
+      result  = applyRounds words extKey
   List.zipWith Nat64.xor result words
 
--- Mix function: ARX on pairs of 64-bit words
-mix : [Nat64] -> [Nat] -> [Nat64]
-mix ws rots =
-  pairs = List.chunksOf 2 ws
-  List.flatMap (\(pair, r) ->
-    match pair with
-      [a, b] ->
-        let x = Nat64.+ a b
-            y = Nat64.xor (Nat64.rotateLeft b r) x
-        [x, y]
-      other -> other
-  ) (List.zip pairs rots)
-
--- Key schedule expansion
-expandKey : [Nat64] -> (Nat64, Nat64) -> [[Nat64]]
-expandKey key (t0, t1) =
-  c    = 0x5555555555555555  -- Skein constant C240
-  ext  = key ++ [List.foldl Nat64.xor c key]
-  t    = [t0, t1, Nat64.xor t0 t1]
-  -- 19 subkeys for 72 rounds + 1
+-- Key schedule expansion (Spec Section 2.3)
+expandKey : [Nat64] -> [Nat64] -> [[Nat64]]
+expandKey key tweaks =
+  parity  = List.foldl Nat64.xor c240 key
+  extKey  = key ++ [parity]
+  nSubkeys = 19  -- ceil(72/4) + 1
   List.map (\s ->
-    let base = List.map (\i -> List.at ext ((s + i) `mod` (StateWords + 1)) |> Optional.getOrElse 0) (List.range 0 StateWords)
-    -- Inject tweak and counter
+    base = List.map (\i ->
+      Optional.getOrElse 0 (List.at extKey ((s + i) `mod` (stateWords + 1)))
+    ) (List.range 0 stateWords)
+    -- Inject tweak into positions StateWords-3 and StateWords-2, counter into StateWords-1
     base
-      |> List.updateAt (StateWords - 3) (Nat64.+ (List.at base (StateWords - 3) |> Optional.getOrElse 0) (List.at t (s `mod` 3) |> Optional.getOrElse 0))
-      |> List.updateAt (StateWords - 2) (Nat64.+ (List.at base (StateWords - 2) |> Optional.getOrElse 0) (List.at t ((s + 1) `mod` 3) |> Optional.getOrElse 0))
-      |> List.updateAt (StateWords - 1) (Nat64.+ (List.at base (StateWords - 1) |> Optional.getOrElse 0) (Nat64.fromNat s))
-  ) (List.range 0 19)
+      |> List.updateAt (stateWords - 3)
+           (Nat64.+ (wordAt base (stateWords - 3)) (wordAt tweaks (s `mod` 3)))
+      |> List.updateAt (stateWords - 2)
+           (Nat64.+ (wordAt base (stateWords - 2)) (wordAt tweaks ((s + 1) `mod` 3)))
+      |> List.updateAt (stateWords - 1)
+           (Nat64.+ (wordAt base (stateWords - 1)) (Nat64.fromNat s))
+  ) (List.range 0 nSubkeys)
 
-addKey : [[Nat64]] -> Nat -> [Nat64] -> [Nat64]
-addKey subkeys i ws =
-  sk = List.at subkeys i |> Optional.getOrElse (List.replicate StateWords 0)
+-- Apply all 72 rounds with subkey injections
+applyRounds : [Nat64] -> [[Nat64]] -> [Nat64]
+applyRounds state subkeys =
+  List.foldl (\(ws, round) ->
+    let rots    = rotRow (round `mod` 8)
+        mixed   = mixWords ws rots
+        permuted = permute mixed
+    if (round + 1) `mod` 4 == 0 then
+      addSubkey permuted subkeys ((round + 1) / 4)
+    else permuted
+  ) state (List.range 0 72)
+
+-- ARX mix: two words a,b → (a+b, rotL(b,r) XOR (a+b))
+mixPair : Nat64 -> Nat64 -> Nat -> (Nat64, Nat64)
+mixPair a b r =
+  x = Nat64.+ a b
+  y = Nat64.xor (Nat64.rotateLeft b r) x
+  (x, y)
+
+-- Apply mix to all 4 pairs in an 8-word state
+mixWords : [Nat64] -> [Nat] -> [Nat64]
+mixWords ws rots =
+  [(w0,r0),(w1,r1),(w2,r2),(w3,r3)] =
+    List.zip (List.chunksOf 2 ws) rots
+  let [(a0,b0),(a1,b1),(a2,b2),(a3,b3)] =
+        List.map (\((a,b),r) -> mixPair a b r)
+          [(w0,r0),(w1,r1),(w2,r2),(w3,r3)]
+  [a0,b0,a1,b1,a2,b2,a3,b3]
+
+-- Threefish-512 permutation P8 (Spec Table 2)
+permute : [Nat64] -> [Nat64]
+permute ws =
+  let get i = Optional.getOrElse 0 (List.at ws i)
+  [get 2, get 1, get 4, get 7, get 6, get 5, get 0, get 3]
+
+addSubkey : [Nat64] -> [[Nat64]] -> Nat -> [Nat64]
+addSubkey ws subkeys s =
+  sk = Optional.getOrElse (List.replicate stateWords 0) (List.at subkeys s)
   List.zipWith Nat64.+ ws sk
 
--- Output transform: produce final hash bytes
-output : [Nat64] -> Bytes
-output state =
-  outBlock = Bytes.replicate BlockSize 0x00
-  outWords = ubiCompress state Tweak_Out outBlock
-  Bytes.fromNat64List outWords
+-- -----------------------------------------------------------------------
+-- Output transform (Spec Section 4.3)
+-- -----------------------------------------------------------------------
 
--- Pad message to block boundary and split into 64-byte chunks
-padAndSplit : Bytes -> Nat -> [Bytes]
-padAndSplit msg blockSize =
-  padded = if Bytes.size msg `mod` blockSize == 0 && Bytes.size msg > 0
-           then msg
-           else msg ++ Bytes.replicate (blockSize - (Bytes.size msg `mod` blockSize)) 0x00
-  Bytes.chunksOf blockSize padded
+outputTransform : [Nat64] -> Bytes
+outputTransform state =
+  ctr     = Bytes.fromNat64LE 0 ++ Bytes.replicate 56 0x00
+  outState = ubiCompress state
+               (flag_FIRST || flag_FINAL || tweak_OUT)
+               8 ctr
+  Bytes.fromNat64ListLE outState
+
+-- -----------------------------------------------------------------------
+-- Utilities
+-- -----------------------------------------------------------------------
+
+rotRow : Nat -> [Nat]
+rotRow i = Optional.getOrElse [0,0,0,0] (List.at rotConsts i)
+
+wordAt : [Nat64] -> Nat -> Nat64
+wordAt xs i = Optional.getOrElse 0 (List.at xs i)
+
+padToBlocks : Bytes -> Nat -> [Bytes]
+padToBlocks msg size =
+  rem = Bytes.size msg `mod` size
+  padded =
+    if rem == 0 && Bytes.size msg > 0 then msg
+    else msg ++ Bytes.replicate (size - rem) 0x00
+  Bytes.chunksOf size padded

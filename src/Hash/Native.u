@@ -1,35 +1,86 @@
 -- Rake :: Hash/Native.u
--- Native backend facade for Skein-512.
--- Current implementation is an ABI contract plus pure-Unison fallback.
+-- FFI facade for the statically linked Skein-1.3 C bridge.
 --
--- Unison's FFI is still being added, so the builtin declarations below
--- are placeholders for the future native bridge rather than a guaranteed
--- working binding today.
+-- At binary startup, before any mining begins:
+--   1. rake_skein_version_assert() is called — hard abort on version mismatch
+--   2. rake_skein512_selftest()    is called — hard abort on any vector failure
+--   3. hash512_selfcheck()         is called — runs pure Unison against same vectors
+--   4. Both results are compared   — hard abort if they disagree on any input
+--
+-- Only after all four checks pass does the miner loop start.
 
-use Hash.Skein
+use Hash.Skein   (hash512 as purHash512, hash512_selfcheck)
+use Hash.Vectors (skein512Vectors)
 
-nativeLibVersion : Text
-nativeLibVersion = "skein-native/0.1"
+-- -----------------------------------------------------------------------
+-- Startup validation — called once from Main before mining begins
+-- -----------------------------------------------------------------------
+
+hashStartupCheck : '{IO, Exception} ()
+hashStartupCheck = do
+  -- 1. C bridge version assertion (builtin: aborts on mismatch)
+  nativeVersionAssert ()
+
+  -- 2. C bridge vector self-test (builtin: aborts on any failure)
+  r = nativeSelftest ()
+  if r != 0 then
+    raise "[rake/native] C bridge self-test returned failure. Aborting."
+  else IO.println "[rake/native] C bridge self-test passed."
+
+  -- 3. Pure Unison reference self-check (aborts on any failure)
+  hash512_selfcheck ()
+
+  -- 4. Cross-check: both implementations must agree on every vector input
+  crossCheck ()
+
+crossCheck : '{IO, Exception} ()
+crossCheck = do
+  failures = List.filterMap (\v ->
+    let native = hash512 v.input
+        pure   = purHash512 v.input
+    if native == pure then None
+    else Some (v.label, native, pure)
+  ) skein512Vectors
+  match failures with
+    [] ->
+      IO.println "[rake] Native and pure Unison Skein-512 agree on all vectors."
+    _  ->
+      List.each failures (\(lbl, n, p) ->
+        IO.println ("DIVERGE: " ++ lbl ++ "\n" ++
+          "  Native: " ++ Bytes.toHex n ++ "\n" ++
+          "  Pure:   " ++ Bytes.toHex p)
+      )
+      raise "[rake] FATAL: Native and pure implementations disagree. Aborting."
+
+-- -----------------------------------------------------------------------
+-- Public hash API
+-- -----------------------------------------------------------------------
 
 hash512 : Bytes -> Bytes
 hash512 input =
-  if nativeAvailable () then
-    nativeSkein512 input
-  else
-    Hash.Skein.hash512 input
+  if nativeAvailable () then nativeSkein512 input
+  else purHash512 input
 
 hashBatch512 : [Bytes] -> [Bytes]
 hashBatch512 inputs =
-  if nativeAvailable () then
-    nativeSkein512Batch inputs
-  else
-    List.map Hash.Skein.hash512 inputs
+  if nativeAvailable () then nativeSkein512Batch inputs
+  else List.map purHash512 inputs
 
-nativeSkein512 : Bytes -> Bytes
-nativeSkein512 = builtin
+-- -----------------------------------------------------------------------
+-- FFI declarations — statically linked from libskein_bridge.a
+-- -----------------------------------------------------------------------
+
+nativeSkein512      : Bytes -> Bytes
+nativeSkein512      = builtin
 
 nativeSkein512Batch : [Bytes] -> [Bytes]
 nativeSkein512Batch = builtin
 
-nativeAvailable : () -> Boolean
-nativeAvailable = builtin
+nativeAvailable     : () -> Boolean
+nativeAvailable     = builtin
+
+nativeVersionAssert : () -> ()
+nativeVersionAssert = builtin
+
+nativeSelftest      : () -> Nat
+nativeSelftest      = builtin
