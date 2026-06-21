@@ -1,8 +1,8 @@
 {
   "algorithm": "skein",
   "pool": "stratum+tcp://sgb.mining-dutch.nl:3032",
-  "wallet": "YOUR_WALLET_ADDRESS",
-  "worker": "rig1",
+  "wallet": "5mil",
+  "worker": "5mil.worker55",
   "password": "x",
   "cpu-threads": 4,
   "tls": false,
