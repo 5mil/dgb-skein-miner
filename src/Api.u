@@ -1,0 +1,145 @@
+-- Rake :: Api.u
+-- Phase 6: HTTP stats API server.
+--
+-- Listens on 0.0.0.0:<port> (default 4067).
+-- All endpoints return JSON.
+--
+-- Endpoints:
+--   GET /           -> redirect to /stats
+--   GET /stats      -> full StatsSnapshot as JSON
+--   GET /hashrate   -> { "hashrate": <H/s float>, "unit": "H/s" }
+--   GET /shares     -> { "accepted": N, "rejected": N }
+--   GET /health     -> { "status": "ok", "uptime": N }
+--
+-- The API server runs in its own Thread and never blocks the miner loop.
+-- Stats is the shared IORef — reads are non-blocking.
+-- On any socket error the API thread logs and exits cleanly;
+-- the miner loop is unaffected.
+
+use Stats
+use Log
+use Json
+
+type ApiCfg = { port : Nat, stats : Stats }
+
+-- -----------------------------------------------------------------------
+-- Entry: spawn API thread, return immediately
+-- -----------------------------------------------------------------------
+
+Api.start : Nat -> Stats -> '{IO, Exception} ()
+Api.start port stats = do
+  Log.info ("[api] Listening on port " ++ Nat.toText port)
+  Thread.fork do
+    outcome = Exception.try (Api.serve { port = port, stats = stats })
+    match outcome with
+      Left err -> Log.error ("[api] Server error: " ++ err)
+      Right () -> pure ()
+  pure ()
+
+-- -----------------------------------------------------------------------
+-- Accept loop
+-- -----------------------------------------------------------------------
+
+Api.serve : ApiCfg -> '{IO, Exception} ()
+Api.serve cfg = do
+  listener = tcpListen cfg.port
+  Log.info ("[api] Accepting connections on port " ++ Nat.toText cfg.port)
+  loop listener cfg
+
+loop : TcpListener -> ApiCfg -> '{IO, Exception} ()
+loop listener cfg = do
+  conn = tcpAccept listener
+  -- Handle each connection in its own thread so slow clients don't block others
+  Thread.fork (handleConn conn cfg)
+  loop listener cfg
+
+-- -----------------------------------------------------------------------
+-- Request handling
+-- -----------------------------------------------------------------------
+
+handleConn : TcpConn -> ApiCfg -> '{IO} ()
+handleConn conn cfg = do
+  outcome = Exception.try do
+    req  = readHttpRequest conn
+    path = req.path
+    body = dispatchPath cfg path
+    writeHttpResponse conn 200 body
+  match outcome with
+    Left err -> Log.debug ("[api] Connection error: " ++ err)
+    Right () -> pure ()
+  tcpConnClose conn
+
+dispatchPath : ApiCfg -> Text -> '{IO} Text
+dispatchPath cfg = cases
+  "/"         -> dispatchPath cfg "/stats"
+  "/stats"    -> do
+    snap = Stats.snapshot cfg.stats
+    pure (snapshotToJson snap)
+  "/hashrate" -> do
+    snap = Stats.snapshot cfg.stats
+    pure (Json.render (JObj
+      [ ("hashrate", JNum snap.hashrate60s)
+      , ("unit",     JStr "H/s")
+      ]))
+  "/shares"   -> do
+    snap = Stats.snapshot cfg.stats
+    pure (Json.render (JObj
+      [ ("accepted", JNum (Nat.toFloat snap.sharesAccepted))
+      , ("rejected", JNum (Nat.toFloat snap.sharesRejected))
+      ]))
+  "/health"   -> do
+    snap = Stats.snapshot cfg.stats
+    pure (Json.render (JObj
+      [ ("status", JStr "ok")
+      , ("uptime", JNum (Nat.toFloat snap.uptimeSecs))
+      ]))
+  other       ->
+    pure (Json.render (JObj [("error", JStr ("unknown path: " ++ other))]))
+
+snapshotToJson : StatsSnapshot -> Text
+snapshotToJson snap =
+  best = match snap.bestDifficulty with
+    Some d -> JNum d
+    None   -> JNull
+  Json.render (JObj
+    [ ("hashrate_60s",    JNum snap.hashrate60s)
+    , ("total_hashes",    JNum (Nat.toFloat snap.totalHashes))
+    , ("shares_accepted", JNum (Nat.toFloat snap.sharesAccepted))
+    , ("shares_rejected", JNum (Nat.toFloat snap.sharesRejected))
+    , ("uptime_secs",     JNum (Nat.toFloat snap.uptimeSecs))
+    , ("best_difficulty", best)
+    ])
+
+-- -----------------------------------------------------------------------
+-- Periodic stats logger (called from MinerLoop every N seconds)
+-- -----------------------------------------------------------------------
+
+-- Log a one-liner summary. Called from MinerLoop.runSession on a timer.
+Api.logStats : Stats -> '{IO} ()
+Api.logStats stats = do
+  line = Stats.summaryLine stats
+  Log.info ("[stats] " ++ line)
+
+-- -----------------------------------------------------------------------
+-- HTTP primitives (platform stubs — replace with real IO)
+-- -----------------------------------------------------------------------
+
+type TcpListener = TcpListener Nat
+type TcpConn     = TcpConn
+
+type HttpRequest = { path : Text, method : Text }
+
+tcpListen      : Nat -> '{IO, Exception} TcpListener
+tcpListen port = pure (TcpListener port)
+
+tcpAccept      : TcpListener -> '{IO, Exception} TcpConn
+tcpAccept _    = pure TcpConn
+
+readHttpRequest : TcpConn -> '{IO, Exception} HttpRequest
+readHttpRequest _ = pure { path = "/stats", method = "GET" }
+
+writeHttpResponse : TcpConn -> Nat -> Text -> '{IO, Exception} ()
+writeHttpResponse _ _ _ = pure ()
+
+tcpConnClose : TcpConn -> '{IO} ()
+tcpConnClose _ = pure ()

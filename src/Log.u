@@ -1,0 +1,96 @@
+-- Rake :: Log.u
+-- Phase 6: Structured logging with level, timestamp, and colour.
+--
+-- Log levels: DEBUG < INFO < WARN < ERROR
+-- Level is set globally at startup from config/CLI.
+-- Each line is written atomically to stderr.
+--
+-- Format:
+--   2026-06-21 23:24:16 [INFO ] [rake] message
+--   2026-06-21 23:24:16 [WARN ] [rake] message
+--   2026-06-21 23:24:16 [ERROR] [rake] message
+--
+-- Colour (ANSI, disabled if NO_COLOR env var is set or output is not a TTY):
+--   DEBUG = dim
+--   INFO  = green
+--   WARN  = yellow
+--   ERROR = red bold
+
+type LogLevel = DEBUG | INFO | WARN | ERROR
+
+type LogCfg = { minLevel : LogLevel, useColour : Boolean }
+
+-- Global log config (set once at startup)
+globalLogCfg : IORef LogCfg
+globalLogCfg = IORef.new { minLevel = INFO, useColour = true }
+
+Log.init : LogLevel -> Boolean -> '{IO} ()
+Log.init level colour = IORef.write globalLogCfg { minLevel = level, useColour = colour }
+
+-- -----------------------------------------------------------------------
+-- Public entrypoints
+-- -----------------------------------------------------------------------
+
+Log.debug : Text -> '{IO} ()
+Log.debug msg = logAt DEBUG msg
+
+Log.info : Text -> '{IO} ()
+Log.info msg = logAt INFO msg
+
+Log.warn : Text -> '{IO} ()
+Log.warn msg = logAt WARN msg
+
+Log.error : Text -> '{IO} ()
+Log.error msg = logAt ERROR msg
+
+-- -----------------------------------------------------------------------
+-- Internals
+-- -----------------------------------------------------------------------
+
+logAt : LogLevel -> Text -> '{IO} ()
+logAt level msg = do
+  cfg = IORef.read globalLogCfg
+  if levelNum level >= levelNum cfg.minLevel then do
+    now   = Time.epochMillis ()
+    ts    = formatTimestamp now
+    label = levelLabel level
+    line  =
+      if cfg.useColour then
+        levelColour level ++ ts ++ " " ++ label ++ " [rake] " ++ msg ++ ansiReset
+      else
+        ts ++ " " ++ label ++ " [rake] " ++ msg
+    IO.eprintln line
+  else pure ()
+
+levelNum : LogLevel -> Nat
+levelNum = cases
+  DEBUG -> 0
+  INFO  -> 1
+  WARN  -> 2
+  ERROR -> 3
+
+levelLabel : LogLevel -> Text
+levelLabel = cases
+  DEBUG -> "[DEBUG]"
+  INFO  -> "[INFO ]"
+  WARN  -> "[WARN ]"
+  ERROR -> "[ERROR]"
+
+levelColour : LogLevel -> Text
+levelColour = cases
+  DEBUG -> "\27[2m"      -- dim
+  INFO  -> "\27[32m"     -- green
+  WARN  -> "\27[33m"     -- yellow
+  ERROR -> "\27[1;31m"   -- red bold
+
+ansiReset : Text
+ansiReset = "\27[0m"
+
+-- Format epoch millis as "YYYY-MM-DD HH:MM:SS"
+formatTimestamp : Nat -> Text
+formatTimestamp ms =
+  -- Unison Time.toDateTime or equivalent; placeholder using raw millis
+  -- for now — replace with real calendar decomposition when available
+  secs = ms / 1000
+  -- Structural placeholder: real impl uses Time.utcDatetime secs
+  "(ts:" ++ Nat.toText secs ++ ")"

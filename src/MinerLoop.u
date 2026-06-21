@@ -1,15 +1,15 @@
 -- Rake :: MinerLoop.u
--- Job dispatch, nonce scan, target check, share submission.
--- Phase 3: meetsTarget now gates every submitShare call.
--- Phase 3: nbitsToTarget fed from parsed NotifyParams.nbits.
--- Phase 3: extraNonce2 counter managed here.
+-- Phase 4 rewrite: real concurrent worker pool, clean-abort channel,
+-- per-thread nonce ranges via Worker.u.
 
 use Stratum
 use Hash.Native
 use Config
 use Stats
+use Log
 use Target
 use Header
+use Worker
 use StratumMsg (NotifyParams)
 
 -- -----------------------------------------------------------------------
@@ -31,50 +31,55 @@ tryPools cfg pools failures =
   match pools with
     [] ->
       secs = backoffSeconds failures
-      IO.println ("[miner] All pools failed. Retrying in " ++ Nat.toText secs ++ "s...")
+      Log.warn ("All pools failed. Retrying in " ++ Nat.toText secs ++ "s...")
       Time.sleepSeconds secs
       mineWithFailover cfg (failures + 1)
     pool +: rest ->
       outcome = Exception.try do
         session = Stratum.connect pool
-        runSession cfg session
+        stats   = Stats.new ()
+        runSession cfg session stats
       match outcome with
-        Right () -> pure ()   -- clean exit
+        Right () -> pure ()
         Left err ->
-          IO.println ("[miner] Pool " ++ pool.pool ++ " error: " ++ err)
+          Log.warn ("Pool " ++ pool.pool ++ " error: " ++ err)
           tryPools cfg rest failures
 
 -- -----------------------------------------------------------------------
--- Session loop: receive jobs, mine, submit
+-- Session loop
 -- -----------------------------------------------------------------------
 
-runSession : Config -> StratumSession -> '{IO, Exception} ()
-runSession cfg session =
-  -- Receive events from pool; each tick may update job or difficulty
+runSession : Config -> StratumSession -> Stats -> '{IO, Exception} ()
+runSession cfg session stats =
+  -- Each call to Stratum.tick returns one event and a clean-abort flag
   (session2, cleanAbort) = Stratum.tick session
+  -- If clean_jobs=true, signal abort to any running scan via a shared flag
+  -- (abort flag is passed down; if no job is running it is a no-op)
   match session2.currentJob with
     None ->
-      runSession cfg session2
+      runSession cfg session2 stats
     Some job ->
-      session3 = mineJob cfg session2 job
-      runSession cfg session3
+      (session3, stats2) = mineJob cfg session2 stats job cleanAbort
+      runSession cfg session3 stats2
 
-mineJob : Config -> StratumSession -> NotifyParams -> '{IO, Exception} StratumSession
-mineJob cfg session job = do
-  -- Parse target from notify's nbits field
+-- -----------------------------------------------------------------------
+-- Mine one job
+-- -----------------------------------------------------------------------
+
+mineJob : Config -> StratumSession -> Stats -> NotifyParams -> Boolean
+       -> '{IO, Exception} (StratumSession, Stats)
+mineJob cfg session stats job cleanJobsNow = do
+  -- Parse target
   target = match Target.nbitsToTarget job.nbits with
     Some t -> t
     None   ->
-      IO.println ("[miner] Invalid nbits: " ++ job.nbits ++ " — skipping job")
-      pure session
+      Log.warn ("Invalid nbits: " ++ job.nbits ++ " — skipping")
+      pure (session, stats)
 
-  -- Scale target to pool difficulty
-  poolTarget = Target.diffToTarget session.difficulty
-
-  -- Use the stricter of nbits target and pool target
+  poolTarget     = Target.diffToTarget session.difficulty
   effectiveTarget = BigNat.min target poolTarget
 
-  -- Build header inputs with current nonce space
+  -- Build header inputs
   en2 = nextExtraNonce2 session
   inputs = {
     version        = job.version,
@@ -89,81 +94,51 @@ mineJob cfg session job = do
     nonce          = 0
   }
 
-  -- Scan nonces
-  result = scanNonces cfg.cpuThreads inputs effectiveTarget
-  match result with
+  threadCount = Optional.getOrElse Runtime.cpuCount cfg.cpuThreads
+
+  -- Create abort flag; set it immediately if clean_jobs arrived
+  -- before we even started this scan (edge case: notify + clean in same tick)
+  abort = AbortFlag.new
+  if cleanJobsNow then AbortFlag.set abort
+
+  jobStart = Time.epochMillis ()
+  Log.info ("Job " ++ job.jobId ++ " diff=" ++ Float.toText session.difficulty ++
+            " threads=" ++ Nat.toText threadCount)
+
+  scanResult = Worker.scanJob threadCount inputs effectiveTarget abort
+
+  elapsed = Time.epochMillis () - jobStart
+  stats2  = Stats.recordHashes stats scanResult.totalHashes elapsed
+
+  match scanResult.found with
     None ->
-      -- Exhausted nonce range without finding a share; signal loop to get next job
-      pure session
-    Some (winningNonce, winningHeader) ->
-      -- Gate: double-check target before submitting (never trust only the scan)
-      let digest = Hash.Native.hash512 winningHeader
-      if not (Target.meetsTarget digest effectiveTarget) then do
-        IO.println "[miner] WARNING: scan returned nonce but digest check failed — discarding"
-        pure session
+      if scanResult.aborted then
+        Log.info ("Job " ++ job.jobId ++ " aborted (clean_jobs). " ++
+                  Nat.toText scanResult.totalHashes ++ " hashes in " ++
+                  Nat.toText elapsed ++ "ms")
       else
-        Stratum.submitShare session job (Nat32.toBytes winningNonce) en2
-          (hexToNat32 job.ntime)
+        Log.info ("Job " ++ job.jobId ++ " exhausted nonce space.")
+      pure (session, stats2)
 
--- -----------------------------------------------------------------------
--- Nonce scan
--- -----------------------------------------------------------------------
-
--- Scan the full 32-bit nonce space across N workers.
--- Returns Some (nonce, header) on first valid share, None on exhaustion.
-scanNonces : Optional Nat -> HeaderInputs -> BigNat
-          -> Optional (Nat32, Bytes)
-scanNonces threads inputs target =
-  workers  = Optional.getOrElse Runtime.cpuCount threads
-  ranges   = splitNonceRange workers
-  -- Each worker scans its range independently
-  results  = parallelFind (\(start, stop) ->
-    searchRange inputs target start stop
-  ) ranges
-  results
-
--- Search a contiguous nonce subrange.
--- Returns Some (nonce, header) on first hit.
-searchRange : HeaderInputs -> BigNat -> Nat32 -> Nat32
-           -> Optional (Nat32, Bytes)
-searchRange inputs target start stop =
-  go : Nat32 -> Optional (Nat32, Bytes)
-  go nonce =
-    if nonce > stop then None
-    else
-      let header = buildHeader { inputs | nonce = nonce }
-          digest = Hash.Native.hash512 header
-      if Target.meetsTarget digest target then Some (nonce, header)
-      else go (Nat32.+ nonce 1)
-  go start
-
--- Split [0, 0xFFFFFFFF] into N contiguous equal ranges
-splitNonceRange : Nat -> [(Nat32, Nat32)]
-splitNonceRange n =
-  total = 0xFFFFFFFF : Nat32
-  width = Nat32./ total (Nat32.fromNat (Nat.max n 1))
-  List.map (\i ->
-    start = Nat32.* (Nat32.fromNat i) width
-    stop  = if i == n - 1 then total
-            else Nat32.- (Nat32.* (Nat32.fromNat (i + 1)) width) 1
-    (start, stop)
-  ) (List.range 0 (Nat.max n 1))
-
--- Run tasks in parallel, return first Some result
--- (real parallel impl in Phase 4; correct serial for now)
-parallelFind : (a -> Optional b) -> [a] -> Optional b
-parallelFind f xs =
-  List.foldl (\acc x ->
-    match acc with
-      Some _ -> acc
-      None   -> f x
-  ) None xs
+    Some (nonce, header) ->
+      -- Double-check before submit
+      let digest = Hash.Native.hash512 header
+      if not (Target.meetsTarget digest effectiveTarget) then do
+        Log.warn "Scan returned nonce but digest gate failed — discarding"
+        pure (session, stats2)
+      else do
+        Log.info ("Share found! Job=" ++ job.jobId ++
+                  " nonce=" ++ Nat32.toHex nonce ++
+                  " hashes=" ++ Nat.toText scanResult.totalHashes)
+        session3 = Stratum.submitShare session job (Nat32.toBytes nonce) en2
+                     (hexToNat32 job.ntime)
+        stats3   = Stats.recordShare stats2 true
+        pure (session3, stats3)
 
 -- -----------------------------------------------------------------------
 -- ExtraNonce2 counter
 -- -----------------------------------------------------------------------
 
--- Increment ExtraNonce2 (big-endian counter of session.extraNonce2Size bytes)
 nextExtraNonce2 : StratumSession -> Bytes
 nextExtraNonce2 session =
   n    = session.extraNonce2Size
@@ -174,7 +149,7 @@ incrementBytes : Bytes -> Bytes
 incrementBytes bs =
   go : [Nat8] -> Boolean -> [Nat8]
   go = cases
-    [],        _    -> []
+    [],          _     -> []
     (b +: rest), true  ->
       let sum = Nat8.+ b 1
       if sum == 0 then 0 +: go rest true
@@ -183,17 +158,12 @@ incrementBytes bs =
   Bytes.fromList (List.reverse (go (List.reverse (Bytes.toList bs)) true))
 
 -- -----------------------------------------------------------------------
--- Backoff
+-- Helpers
 -- -----------------------------------------------------------------------
 
 backoffSeconds : Nat -> Nat
 backoffSeconds failures =
   Nat.min (1 `Nat.shiftLeft` Nat.min failures 6) 60
 
--- -----------------------------------------------------------------------
--- Utilities
--- -----------------------------------------------------------------------
-
 hexToNat32 : Text -> Nat32
-hexToNat32 hex =
-  Bytes.toNat32BE (Bytes.fromHex hex)
+hexToNat32 hex = Bytes.toNat32BE (Bytes.fromHex hex)

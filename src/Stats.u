@@ -1,45 +1,158 @@
--- dgb-skein-miner :: Stats.u
--- Tracks hashrate, accepted/rejected shares, uptime.
--- Optionally exposes a minimal HTTP stats API (--api-port).
+-- Rake :: Stats.u
+-- Phase 6: Full mining statistics engine.
+--
+-- Tracks:
+--   - Total hashes computed
+--   - Hashes in a rolling 60-second window (for hashrate)
+--   - Shares accepted / rejected
+--   - Uptime
+--   - Per-minute hashrate samples (last 60 minutes, for sparkline)
+--   - Best difficulty seen (lowest hash/target ratio)
+--
+-- All state is kept in an IORef so workers and the API thread can read it
+-- concurrently without message passing.
 
-use Config
+-- -----------------------------------------------------------------------
+-- Types
+-- -----------------------------------------------------------------------
 
-type MinerStats = {
-  startTime       : Nat,
-  hashesComputed  : Nat,
-  sharesAccepted  : Nat,
-  sharesRejected  : Nat,
-  currentHashrate : Float
+-- One sample: (epochMillis, hashesInThatWindow)
+type HashSample = { ts : Nat, hashes : Nat }
+
+type StatsState = {
+  totalHashes    : Nat,
+  sharesAccepted : Nat,
+  sharesRejected : Nat,
+  startTime      : Nat,          -- epoch millis
+  -- Rolling window: list of (ts, hashes) entries from last 60s
+  rollingWindow  : [HashSample],
+  -- Per-minute samples for sparkline (last 60 entries)
+  minuteSamples  : [Float],
+  bestDifficulty : Optional Float
 }
 
-Stats.init : Config -> '{IO} ()
-Stats.init cfg = do
-  state = Ref.new {
-    startTime      = Time.now (),
-    hashesComputed = 0,
+type Stats = Stats (IORef StatsState)
+
+-- -----------------------------------------------------------------------
+-- Construction
+-- -----------------------------------------------------------------------
+
+Stats.new : '{IO} Stats
+Stats.new = do
+  now = Time.epochMillis ()
+  ref = IORef.new {
+    totalHashes    = 0,
     sharesAccepted = 0,
     sharesRejected = 0,
-    currentHashrate = 0.0
+    startTime      = now,
+    rollingWindow  = [],
+    minuteSamples  = [],
+    bestDifficulty = None
   }
-  match cfg.apiPort with
-    Some port -> startApiServer state port
-    None      -> ()
+  pure (Stats ref)
 
-Stats.recordShare : () -> '{IO} ()
-Stats.recordShare _ = do
-  -- Increment accepted share count
-  s = Ref.get state
-  Ref.set state { s | sharesAccepted = s.sharesAccepted + 1 }
+-- -----------------------------------------------------------------------
+-- Recording
+-- -----------------------------------------------------------------------
 
-Stats.printStatus : MinerStats -> '{IO} ()
-Stats.printStatus s = do
-  let rate = formatHashrate s.currentHashrate
-  IO.println ("[dgb-skein-miner] Hashrate: " ++ rate
-    ++ " | Accepted: " ++ Nat.toText s.sharesAccepted
-    ++ " | Rejected: " ++ Nat.toText s.sharesRejected)
+Stats.recordHashes : Stats -> Nat -> Nat -> '{IO} Stats
+Stats.recordHashes s@(Stats ref) count elapsedMs = do
+  now = Time.epochMillis ()
+  IORef.modify ref (\st ->
+    let sample  = { ts = now, hashes = count }
+        cutoff  = now - 60000
+        window2 = List.filter (\h -> h.ts >= cutoff) st.rollingWindow
+        window3 = window2 ++ [sample]
+    { st
+      | totalHashes   = st.totalHashes + count
+      , rollingWindow = window3
+    }
+  )
+  pure s
+
+Stats.recordShare : Stats -> Boolean -> '{IO} Stats
+Stats.recordShare s@(Stats ref) accepted = do
+  IORef.modify ref (\st ->
+    if accepted then { st | sharesAccepted = st.sharesAccepted + 1 }
+    else             { st | sharesRejected = st.sharesRejected + 1 }
+  )
+  pure s
+
+Stats.recordDifficulty : Stats -> Float -> '{IO} Stats
+Stats.recordDifficulty s@(Stats ref) diff = do
+  IORef.modify ref (\st ->
+    let best2 = match st.bestDifficulty with
+          None   -> Some diff
+          Some b -> Some (Float.max b diff)
+    { st | bestDifficulty = best2 }
+  )
+  pure s
+
+-- -----------------------------------------------------------------------
+-- Readings
+-- -----------------------------------------------------------------------
+
+-- Hashes per second over the last 60 seconds
+Stats.hashrate60s : Stats -> '{IO} Float
+Stats.hashrate60s (Stats ref) = do
+  st  = IORef.read ref
+  now = Time.epochMillis ()
+  let cutoff  = now - 60000
+      window  = List.filter (\h -> h.ts >= cutoff) st.rollingWindow
+      total   = List.foldl (\acc h -> acc + h.hashes) 0 window
+      elapsed = match (List.head window, List.last window) with
+        (Some first, Some last) -> Nat.max 1 (last.ts - first.ts)
+        _                       -> 1
+  pure (Nat.toFloat total / Nat.toFloat elapsed * 1000.0)
+
+-- Current snapshot for API / logging
+type StatsSnapshot = {
+  hashrate60s    : Float,
+  totalHashes    : Nat,
+  sharesAccepted : Nat,
+  sharesRejected : Nat,
+  uptimeSecs     : Nat,
+  bestDifficulty : Optional Float
+}
+
+Stats.snapshot : Stats -> '{IO} StatsSnapshot
+Stats.snapshot s@(Stats ref) = do
+  st      = IORef.read ref
+  now     = Time.epochMillis ()
+  hr      = Stats.hashrate60s s
+  uptime  = (now - st.startTime) / 1000
+  pure {
+    hashrate60s    = hr,
+    totalHashes    = st.totalHashes,
+    sharesAccepted = st.sharesAccepted,
+    sharesRejected = st.sharesRejected,
+    uptimeSecs     = uptime,
+    bestDifficulty = st.bestDifficulty
+  }
+
+-- Human-readable one-liner for log output
+Stats.summaryLine : Stats -> '{IO} Text
+Stats.summaryLine s = do
+  snap = Stats.snapshot s
+  let hr  = formatHashrate snap.hashrate60s
+      acc = Nat.toText snap.sharesAccepted
+      rej = Nat.toText snap.sharesRejected
+      up  = formatUptime snap.uptimeSecs
+  pure (hr ++ " | accepted=" ++ acc ++ " rejected=" ++ rej ++ " uptime=" ++ up)
 
 formatHashrate : Float -> Text
-formatHashrate h =
-  if h >= 1_000_000.0      then Float.toText (h / 1_000_000.0) ++ " MH/s"
-  else if h >= 1_000.0     then Float.toText (h / 1_000.0)     ++ " KH/s"
-  else                          Float.toText h                  ++ " H/s"
+formatHashrate hps =
+  if hps >= 1000000.0 then
+    Float.toText (Float.truncateTo 2 (hps / 1000000.0)) ++ " MH/s"
+  else if hps >= 1000.0 then
+    Float.toText (Float.truncateTo 2 (hps / 1000.0)) ++ " KH/s"
+  else
+    Float.toText (Float.truncateTo 2 hps) ++ " H/s"
+
+formatUptime : Nat -> Text
+formatUptime secs =
+  h = secs / 3600
+  m = (secs `Nat.mod` 3600) / 60
+  s = secs `Nat.mod` 60
+  pad2 n = if n < 10 then "0" ++ Nat.toText n else Nat.toText n
+  pad2 h ++ ":" ++ pad2 m ++ ":" ++ pad2 s

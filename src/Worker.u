@@ -1,0 +1,173 @@
+-- Rake :: Worker.u
+-- Phase 4: Concurrent worker pool with clean-abort support.
+--
+-- Architecture:
+--   - Coordinator owns a shared AbortFlag (mutable Boolean)
+--   - Each worker is a Unison Thread scanning its assigned nonce subrange
+--   - On clean_jobs=true the coordinator sets AbortFlag; workers check it
+--     every ABORT_CHECK_INTERVAL hashes and stop immediately
+--   - First worker to find a valid share writes to a ResultRef and sets AbortFlag
+--     so all other workers stop scanning that job
+--   - Coordinator joins all threads, reads ResultRef, returns result
+--
+-- Per-thread nonce assignment:
+--   nonce space [0x00000000 .. 0xFFFFFFFF] split into N equal contiguous ranges.
+--   If N does not divide 0x100000000 evenly the last worker gets the remainder.
+--   Workers never overlap.
+
+use Target
+use Header
+use Hash.Native
+
+-- -----------------------------------------------------------------------
+-- Abort flag: shared mutable Boolean
+-- Unison's IORef is the primitive here.
+-- -----------------------------------------------------------------------
+
+type AbortFlag = AbortFlag (IORef Boolean)
+
+AbortFlag.new : '{IO} AbortFlag
+AbortFlag.new = do
+  ref = IORef.new false
+  pure (AbortFlag ref)
+
+AbortFlag.check : AbortFlag -> '{IO} Boolean
+AbortFlag.check (AbortFlag ref) = IORef.read ref
+
+AbortFlag.set : AbortFlag -> '{IO} ()
+AbortFlag.set (AbortFlag ref) = IORef.write ref true
+
+-- -----------------------------------------------------------------------
+-- Result ref: first winning nonce written here
+-- -----------------------------------------------------------------------
+
+type ResultRef = ResultRef (IORef (Optional (Nat32, Bytes)))
+
+ResultRef.new : '{IO} ResultRef
+ResultRef.new = do
+  ref = IORef.new None
+  pure (ResultRef ref)
+
+ResultRef.write : ResultRef -> Nat32 -> Bytes -> '{IO} ()
+ResultRef.write (ResultRef ref) nonce header =
+  IORef.write ref (Some (nonce, header))
+
+ResultRef.read : ResultRef -> '{IO} (Optional (Nat32, Bytes))
+ResultRef.read (ResultRef ref) = IORef.read ref
+
+-- -----------------------------------------------------------------------
+-- Worker configuration
+-- -----------------------------------------------------------------------
+
+-- How often (in hashes) each worker checks the abort flag.
+-- Lower = more responsive to clean_jobs; higher = less overhead.
+ABORT_CHECK_INTERVAL : Nat
+ABORT_CHECK_INTERVAL = 1024
+
+type WorkerCfg = {
+  workerId   : Nat,
+  inputs     : HeaderInputs,
+  target     : BigNat,
+  nonceStart : Nat32,
+  nonceStop  : Nat32,
+  abort      : AbortFlag,
+  result     : ResultRef,
+  hashCount  : IORef Nat   -- worker writes total hashes for stats
+}
+
+-- -----------------------------------------------------------------------
+-- Worker thread body
+-- -----------------------------------------------------------------------
+
+Worker.run : WorkerCfg -> '{IO} ()
+Worker.run cfg = do
+  go cfg.nonceStart 0
+  where
+    go : Nat32 -> Nat -> '{IO} ()
+    go nonce batch =
+      -- Check abort every ABORT_CHECK_INTERVAL hashes
+      shouldAbort =
+        if batch >= ABORT_CHECK_INTERVAL then do
+          IORef.modify cfg.hashCount (Nat.+ ABORT_CHECK_INTERVAL)
+          AbortFlag.check cfg.abort
+        else pure false
+      if shouldAbort then pure ()   -- clean exit
+      else if nonce > cfg.nonceStop then do
+        -- Exhausted range; record remaining hashes
+        IORef.modify cfg.hashCount (Nat.+ (Nat32.toNat (Nat32.- nonce cfg.nonceStart) - batch))
+        pure ()
+      else
+        let header = buildHeader { cfg.inputs | nonce = nonce }
+            digest = Hash.Native.hash512 header
+        if Target.meetsTarget digest cfg.target then do
+          ResultRef.write cfg.result nonce header
+          AbortFlag.set cfg.abort
+          pure ()
+        else
+          go (Nat32.+ nonce 1) (batch + 1)
+
+-- -----------------------------------------------------------------------
+-- Pool: spawn N workers, wait, return result + total hashes
+-- -----------------------------------------------------------------------
+
+type ScanResult = {
+  found      : Optional (Nat32, Bytes),
+  totalHashes : Nat,
+  aborted    : Boolean   -- true if stopped by clean_jobs, not exhaustion
+}
+
+Worker.scanJob : Nat -> HeaderInputs -> BigNat -> AbortFlag
+             -> '{IO, Exception} ScanResult
+Worker.scanJob threadCount inputs target externalAbort = do
+  abort   = externalAbort   -- reuse the coordinator's abort flag
+  result  = ResultRef.new
+  hashRefs = List.map (\_ -> IORef.new 0) (List.range 0 threadCount)
+  ranges  = splitNonceRange threadCount
+
+  -- Spawn all workers
+  threads = List.zipWith (\(start, stop) hashRef i ->
+    let cfg = {
+          workerId   = i,
+          inputs     = inputs,
+          target     = target,
+          nonceStart = start,
+          nonceStop  = stop,
+          abort      = abort,
+          result     = result,
+          hashCount  = hashRef
+        }
+    Thread.fork (Worker.run cfg)
+  ) ranges hashRefs (List.range 0 threadCount)
+
+  -- Wait for all threads to finish
+  List.each threads Thread.await
+
+  -- Collect hash counts
+  totalHashes = List.foldl (\acc ref ->
+    acc + IORef.read ref
+  ) 0 hashRefs
+
+  found     = ResultRef.read result
+  wasAborted = AbortFlag.check abort
+
+  pure {
+    found       = found,
+    totalHashes = totalHashes,
+    aborted     = wasAborted && Optional.isNone found
+  }
+
+-- -----------------------------------------------------------------------
+-- Nonce range splitter (identical to Phase 3; moved here as canonical home)
+-- -----------------------------------------------------------------------
+
+splitNonceRange : Nat -> [(Nat32, Nat32)]
+splitNonceRange n =
+  total = 0xFFFFFFFF : Nat32
+  sz    = Nat.max n 1
+  width = Nat32./ total (Nat32.fromNat sz)
+  List.map (\i ->
+    start = Nat32.* (Nat32.fromNat i) width
+    stop  = if i == sz - 1 then total
+            else Nat32.- (Nat32.* (Nat32.fromNat (i + 1)) width) 1
+    (start, stop)
+  ) (List.range 0 sz)

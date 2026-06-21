@@ -1,37 +1,72 @@
 -- Rake :: Main.u
--- Entry point: parse CLI args, load config, start miner.
+-- Startup sequence:
+--   1. Parse CLI args
+--   2. Load config
+--   3. Validate config
+--   4. Init logging
+--   5. Skein-512 self-test (C bridge)
+--   6. Skein-512 self-test (pure Unison)
+--   7. Cross-check
+--   8. Target conversion self-test
+--   9. Header assembly self-test
+--  10. Print banner
+--  11. Start stats API server (Phase 6)
+--  12. Start miner loop
 
 use Args
 use Config
+use Hash.Native
+use Hash.Skein
+use Target
+use Header
 use MinerLoop
 use Stats
-
-version : Text
-version = "Rake/0.1.0 (dgb-skein)"
+use Api
+use Log
 
 main : '{IO, Exception} ()
 main = do
-  argv = IO.getArgs ()
+  -- 1. CLI
+  args   = Args.parse (Runtime.args ())
+  parsed = Args.validate args
 
-  -- Handle --help / --version before full parse
-  if List.contains "--help" argv || List.contains "-h" argv then
-    IO.println Args.helpText
-  else if List.contains "--version" argv || List.contains "-v" argv then
-    IO.println version
-  else
-    match Args.parse argv with
-      Left errs ->
-        -- Print all errors then show usage hint
-        List.each (Args.renderErrors errs) IO.println
-        IO.println "\nRun with --help for usage."
-        IO.exit 1
-      Right parsed ->
-        cfg = Config.fromParsed parsed
-        match Config.validate cfg with
-          Left missing ->
-            IO.println ("[rake] Missing required config: " ++ missing)
-            IO.println "Run with --help for usage."
-            IO.exit 1
-          Right validCfg ->
-            _ = Stats.init validCfg
-            MinerLoop.start validCfg
+  -- 2. Config
+  cfg    = Config.load parsed
+
+  -- 3. Validate
+  Config.validate cfg
+
+  -- 4. Logging
+  logLevel = if parsed.verbose then DEBUG else INFO
+  noColor  = Optional.isSome (Env.get "NO_COLOR")
+  Log.init logLevel (not noColor)
+
+  -- 5-7. Hash self-tests
+  Hash.Native.nativeVersionAssert ()
+  Hash.Native.nativeSelftest ()
+  Hash.Skein.hash512_selfcheck ()
+  Hash.Native.crossCheck ()
+
+  -- 8. Target self-test
+  Target.selftest ()
+
+  -- 9. Header self-test
+  Header.selftest ()
+
+  -- 10. Banner
+  Log.info "Rake v0.1.0 — DGB Skein miner (Unison)"
+  Log.info ("Threads: " ++ Nat.toText (Optional.getOrElse Runtime.cpuCount cfg.cpuThreads))
+  Log.info ("Pool:    " ++ match List.head cfg.pools with
+    Some p -> p.pool
+    None   -> "(none)")
+  Log.info ("Worker:  " ++ match List.head cfg.pools with
+    Some p -> p.wallet ++ "." ++ p.worker
+    None   -> "(none)")
+
+  -- 11. Stats + API
+  stats = Stats.new ()
+  apiPort = Optional.getOrElse 4067 cfg.apiPort
+  Api.start apiPort stats
+
+  -- 12. Mine
+  MinerLoop.start cfg
