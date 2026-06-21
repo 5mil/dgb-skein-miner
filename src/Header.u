@@ -1,0 +1,151 @@
+-- Rake :: Header.u
+-- DGB/Bitcoin block header assembly and coinbase construction.
+--
+-- 80-byte header layout (all fields little-endian):
+--   [0..3]   version     (4 bytes, int32 LE)
+--   [4..35]  prevHash    (32 bytes, internal byte order = reversed)
+--   [36..67] merkleRoot  (32 bytes, internal byte order)
+--   [68..71] ntime       (4 bytes, uint32 LE)
+--   [72..75] nbits       (4 bytes, uint32 LE)
+--   [76..79] nonce       (4 bytes, uint32 LE)
+--
+-- Spec: https://developer.bitcoin.org/reference/block_chain.html
+-- DGB uses identical 80-byte header structure.
+--
+-- Coinbase assembly:
+--   coinbase_txn = coinbase1 ++ extraNonce1 ++ extraNonce2 ++ coinbase2
+-- Merkle root:
+--   txid0 = SHA256d(coinbase_txn)
+--   root  = merkle_step(txid0, branches)
+--   where merkle_step(h, [b|bs]) = merkle_step(SHA256d(h++b), bs)
+--         merkle_step(h, [])     = h
+--
+-- Note: DGB Skein hashes the 80-byte header with Skein-512, not SHA256d.
+-- The merkle root itself is still constructed with SHA256d per Bitcoin spec.
+
+use Target
+
+type HeaderInputs = {
+  version        : Text,   -- hex Nat32 from notify
+  prevHash       : Text,   -- hex 32 bytes from notify
+  coinbase1      : Text,   -- hex from notify
+  coinbase2      : Text,   -- hex from notify
+  merkleBranches : [Text], -- hex from notify
+  ntime          : Text,   -- hex Nat32 from notify
+  nbits          : Text,   -- hex Nat32 from notify
+  extraNonce1    : Bytes,  -- from subscribe
+  extraNonce2    : Bytes,  -- incremented by miner loop
+  nonce          : Nat32   -- candidate nonce
+}
+
+-- Build the full 80-byte header ready to hash.
+buildHeader : HeaderInputs -> Bytes
+buildHeader h =
+  verBytes    = hexToLE32 h.version
+  prevBytes   = Bytes.reverse (Bytes.fromHex h.prevHash)  -- internal byte order
+  merkleBytes = computeMerkleRoot h
+  ntimeBytes  = hexToLE32 h.ntime
+  nbitsBytes  = hexToLE32 h.nbits
+  nonceBytes  = Nat32.toBytesLE h.nonce
+
+  verBytes ++ prevBytes ++ merkleBytes ++ ntimeBytes ++ nbitsBytes ++ nonceBytes
+
+-- Compute merkle root from coinbase + branches.
+-- Returns 32 bytes in internal byte order.
+computeMerkleRoot : HeaderInputs -> Bytes
+computeMerkleRoot h =
+  coinbaseTxn  = Bytes.fromHex h.coinbase1
+              ++ h.extraNonce1
+              ++ h.extraNonce2
+              ++ Bytes.fromHex h.coinbase2
+  coinbaseTxid = sha256d coinbaseTxn
+  List.foldl (\current branchHex ->
+    let branch = Bytes.fromHex branchHex
+    sha256d (current ++ branch)
+  ) coinbaseTxid h.merkleBranches
+
+-- -----------------------------------------------------------------------
+-- Header validation table: known DGB Skein block headers
+-- Each entry provides a full known-good header (hex) and its expected
+-- hash (hex), allowing us to confirm our header assembly and hash
+-- function produce the correct output together.
+--
+-- These are representative well-known blocks — any valid DGB Skein
+-- block can be added here.
+-- -----------------------------------------------------------------------
+
+type HeaderVector = {
+  label      : Text,
+  headerHex  : Text,   -- 80-byte header in hex (160 chars)
+  expectedHashHex : Text  -- Skein-512 of header, first 32 bytes LE
+}
+
+headerVectors : [HeaderVector]
+headerVectors =
+  [ { label = "DGB Skein genesis-era structure validation"
+    -- Synthetic validation: build header from known fields,
+    -- confirm assembly produces a 80-byte output of correct structure.
+    -- Real mainnet hash vectors should be inserted here once chain data
+    -- is verified out-of-band against a trusted DGB node.
+    , headerHex = ""
+    , expectedHashHex = ""
+    }
+  ]
+
+-- Validate header assembly: build from fields and check length + structure.
+-- Full hash validation requires a running DGB node for ground truth;
+-- structure validation catches byte-order and assembly bugs.
+Header.selftest : '{IO, Exception} ()
+Header.selftest = do
+  IO.println "[rake/header] Running header assembly self-test..."
+
+  -- Test 1: buildHeader produces exactly 80 bytes
+  testInput = {
+    version        = "00000004",
+    prevHash       = "0000000000000000000000000000000000000000000000000000000000000000",
+    coinbase1      = "01000000",
+    coinbase2      = "ffffffff",
+    merkleBranches = [],
+    ntime          = "5d4b2100",
+    nbits          = "1e0fffff",
+    extraNonce1    = Bytes.fromHex "deadbeef",
+    extraNonce2    = Bytes.fromHex "00000001",
+    nonce          = 0
+  }
+  let header = buildHeader testInput
+  if Bytes.size header != 80 then
+    raise ("[rake/header] FATAL: buildHeader returned " ++
+           Nat.toText (Bytes.size header) ++ " bytes, expected 80")
+  else IO.println "[rake/header] Header size: OK (80 bytes)"
+
+  -- Test 2: version field is at offset 0..3 in little-endian
+  verSlice = Bytes.slice 0 4 header
+  if verSlice != Bytes.fromHex "00000004" then
+    raise "[rake/header] FATAL: version field byte order wrong"
+  else IO.println "[rake/header] Version field: OK"
+
+  -- Test 3: nBits field at offset 72..75
+  nbitsSlice = Bytes.slice 72 76 header
+  if nbitsSlice != Bytes.fromHex "ffff0f1e" then  -- LE of 1e0fffff
+    raise ("[rake/header] FATAL: nBits field wrong: got " ++ Bytes.toHex nbitsSlice)
+  else IO.println "[rake/header] nBits field: OK"
+
+  IO.println "[rake/header] Header assembly self-test passed."
+
+-- -----------------------------------------------------------------------
+-- Utilities
+-- -----------------------------------------------------------------------
+
+-- Parse a hex Nat32 string and write it as 4 bytes little-endian
+hexToLE32 : Text -> Bytes
+hexToLE32 hex =
+  w = Bytes.toNat32BE (Bytes.fromHex hex)
+  Nat32.toBytesLE w
+
+-- SHA256d: double-SHA256 used for coinbase txid and merkle steps
+-- (Unison builtin or native bridge in Phase 5 — placeholder here)
+sha256d : Bytes -> Bytes
+sha256d input =
+  -- TODO: wire to native SHA256d once bridge is available
+  -- For now: structural placeholder — returns 32 zero bytes of correct size
+  Bytes.replicate 32 0x00
