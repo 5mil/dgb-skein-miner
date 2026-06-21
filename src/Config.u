@@ -1,0 +1,52 @@
+-- dgb-skein-miner :: Config.u
+-- Resolves config from CLI flags and optional config.json / pools.json files.
+-- CLI flags take precedence over file values.
+
+type Algorithm = Skein
+
+type PoolEntry = { pool : Text, wallet : Text, worker : Text, password : Text }
+
+type Config = {
+  algorithm   : Algorithm,
+  pools       : [PoolEntry],
+  cpuThreads  : Optional Nat,
+  disableGpu  : Boolean,
+  disableCpu  : Boolean,
+  tls         : Boolean,
+  logFile     : Optional Text,
+  apiPort     : Optional Nat,
+  background  : Boolean
+}
+
+-- Parses flags like SRBMiner:
+--   --algorithm skein
+--   --pool stratum+tcp://host:port
+--   --wallet ADDR
+--   --worker rig1
+--   --password x
+--   --cpu-threads 4
+--   --tls true
+--   --config-file config.json
+--   --pools-file pools.json
+--   --background
+--   --log-file miner.log
+--   --api-port 8080
+Config.load : [Text] -> Config
+Config.load args =
+  filePath  = flagValue args "--config-file" |> Optional.getOrElse "config.json"
+  poolsPath = flagValue args "--pools-file"  |> Optional.getOrElse "pools.json"
+  fileCfg   = JSON.parseFile filePath
+  filePool  = JSON.parseFile poolsPath
+  merge fileCfg filePool args
+
+-- Helper: extract value after a named flag
+flagValue : [Text] -> Text -> Optional Text
+flagValue args flag =
+  go : [Text] -> Optional Text
+  go = cases
+    []        -> None
+    [_]       -> None
+    k +: v +: rest ->
+      if k == flag then Some v
+      else go (v +: rest)
+  go args

@@ -1,0 +1,124 @@
+-- dgb-skein-miner :: Hash/Skein.u
+-- Pure Unison Skein-512 implementation.
+-- Based on the Skein 1.3 specification (Threefish-512 + UBI chaining).
+--
+-- Reference: https://www.schneier.com/academic/skein/
+
+use Bytes
+
+-- Block / state sizes
+BlockSize   : Nat
+BlockSize   = 64  -- 512 bits / 8
+
+StateWords  : Nat
+StateWords  = 8   -- 8 x 64-bit words
+
+-- Threefish-512 rotation constants (from Skein 1.3 spec)
+rotConsts : [[Nat]]
+rotConsts = [
+  [46, 36, 19, 37],
+  [33, 27, 14, 42],
+  [17, 49, 36, 39],
+  [44,  9, 54, 56]
+]
+
+-- UBI tweak type values
+Tweak_Config : Nat64
+Tweak_Config = 0x4C00000000000000
+
+Tweak_Message : Nat64
+Tweak_Message = 0x7000000000000000
+
+Tweak_Out : Nat64
+Tweak_Out = 0x6300000000000000
+
+-- Main entry: hash any Bytes input, output 512-bit (64-byte) digest
+hash512 : Bytes -> Bytes
+hash512 msg =
+  cfg    = initConfig 512
+  after1 = ubiCompress cfg Tweak_Config (skeinConfigBlock 512)
+  after2 = ubiCompress after1 Tweak_Message msg
+  output after2
+
+-- Build the Skein configuration block (32 bytes for output length)
+skeinConfigBlock : Nat -> Bytes
+skeinConfigBlock outBits =
+  -- Schema ID: 0x53484152 ("SHAR"), version 1, output length in bits
+  magic   = Bytes.fromList [0x53, 0x48, 0x41, 0x52, 0x44, 0x00, 0x01, 0x00]
+  outLen  = Nat64.toBytes (Nat.toNat64 outBits)
+  Bytes.++ magic outLen ++ Bytes.replicate 16 0x00
+
+-- Initialize state to all zeros (IV)
+initConfig : Nat -> [Nat64]
+initConfig _ = List.replicate StateWords 0
+
+-- UBI compression with arbitrary-length message
+ubiCompress : [Nat64] -> Nat64 -> Bytes -> [Nat64]
+ubiCompress state tweakType msg =
+  blocks = padAndSplit msg BlockSize
+  foldl (\st (i, blk) ->
+    let tweak = buildTweak tweakType i (Bytes.size msg)
+    threefishEncrypt st blk tweak
+  ) state (List.indexed blocks)
+
+-- Threefish-512 block cipher
+threefishEncrypt : [Nat64] -> Bytes -> (Nat64, Nat64) -> [Nat64]
+threefishEncrypt key block tweak =
+  words = Bytes.toNat64List block
+  kw    = expandKey key tweak
+  -- 72 rounds of mixing
+  result = foldl (\ws round ->
+    mix ws (rotConsts |> List.at (round `mod` 4) |> Optional.getOrElse [])
+    |> addKey kw (round / 4)
+  ) words (List.range 0 72)
+  -- Feed-forward XOR with input
+  List.zipWith Nat64.xor result words
+
+-- Mix function: ARX on pairs of 64-bit words
+mix : [Nat64] -> [Nat] -> [Nat64]
+mix ws rots =
+  pairs = List.chunksOf 2 ws
+  List.flatMap (\(pair, r) ->
+    match pair with
+      [a, b] ->
+        let x = Nat64.+ a b
+            y = Nat64.xor (Nat64.rotateLeft b r) x
+        [x, y]
+      other -> other
+  ) (List.zip pairs rots)
+
+-- Key schedule expansion
+expandKey : [Nat64] -> (Nat64, Nat64) -> [[Nat64]]
+expandKey key (t0, t1) =
+  c    = 0x5555555555555555  -- Skein constant C240
+  ext  = key ++ [List.foldl Nat64.xor c key]
+  t    = [t0, t1, Nat64.xor t0 t1]
+  -- 19 subkeys for 72 rounds + 1
+  List.map (\s ->
+    let base = List.map (\i -> List.at ext ((s + i) `mod` (StateWords + 1)) |> Optional.getOrElse 0) (List.range 0 StateWords)
+    -- Inject tweak and counter
+    base
+      |> List.updateAt (StateWords - 3) (Nat64.+ (List.at base (StateWords - 3) |> Optional.getOrElse 0) (List.at t (s `mod` 3) |> Optional.getOrElse 0))
+      |> List.updateAt (StateWords - 2) (Nat64.+ (List.at base (StateWords - 2) |> Optional.getOrElse 0) (List.at t ((s + 1) `mod` 3) |> Optional.getOrElse 0))
+      |> List.updateAt (StateWords - 1) (Nat64.+ (List.at base (StateWords - 1) |> Optional.getOrElse 0) (Nat64.fromNat s))
+  ) (List.range 0 19)
+
+addKey : [[Nat64]] -> Nat -> [Nat64] -> [Nat64]
+addKey subkeys i ws =
+  sk = List.at subkeys i |> Optional.getOrElse (List.replicate StateWords 0)
+  List.zipWith Nat64.+ ws sk
+
+-- Output transform: produce final hash bytes
+output : [Nat64] -> Bytes
+output state =
+  outBlock = Bytes.replicate BlockSize 0x00
+  outWords = ubiCompress state Tweak_Out outBlock
+  Bytes.fromNat64List outWords
+
+-- Pad message to block boundary and split into 64-byte chunks
+padAndSplit : Bytes -> Nat -> [Bytes]
+padAndSplit msg blockSize =
+  padded = if Bytes.size msg `mod` blockSize == 0 && Bytes.size msg > 0
+           then msg
+           else msg ++ Bytes.replicate (blockSize - (Bytes.size msg `mod` blockSize)) 0x00
+  Bytes.chunksOf blockSize padded

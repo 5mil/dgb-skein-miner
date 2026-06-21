@@ -1,0 +1,16 @@
+# Compiled binary
+miner
+miner.exe
+
+# Logs
+*.log
+miner.log
+
+# UCM build artifacts
+.unison/
+_build/
+
+# Editor
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,13 @@
+-- dgb-skein-miner :: Main.u
+-- Entry point. Parses CLI flags, loads config, and starts the miner loop.
+
+use Config
+use MinerLoop
+use Stats
+
+main : '{IO, Exception} ()
+main = do
+  args    = CLI.args ()
+  cfg     = Config.load args
+  _       = Stats.init cfg
+  MinerLoop.start cfg

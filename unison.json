@@ -1,0 +1,10 @@
+{
+  "name": "5mil/dgb-skein-miner",
+  "version": "0.1.0",
+  "description": "Cross-platform DigiByte Skein miner with SRBMiner-compatible CLI",
+  "license": "MIT",
+  "dependencies": [
+    "unison-lang/base"
+  ],
+  "main": "src/Main.u"
+}

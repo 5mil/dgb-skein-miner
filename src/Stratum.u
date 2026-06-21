@@ -1,0 +1,58 @@
+-- dgb-skein-miner :: Stratum.u
+-- Stratum v1 TCP/JSON-RPC protocol layer.
+-- Handles: subscribe, authorize, set_difficulty, notify, submit
+
+use Config.PoolEntry
+
+type StratumJob = {
+  jobId      : Text,
+  prevHash   : Bytes,
+  coinbase1  : Bytes,
+  coinbase2  : Bytes,
+  merkleBranches : [Bytes],
+  version    : Nat32,
+  nbits      : Nat32,
+  ntime      : Nat32,
+  cleanJobs  : Boolean
+}
+
+type StratumState = {
+  socket       : Socket,
+  extraNonce1  : Bytes,
+  extraNonce2Size : Nat,
+  difficulty   : Float,
+  currentJob   : Optional StratumJob
+}
+
+-- Connect to pool and perform initial handshake
+Stratum.connect : PoolEntry -> '{IO, Exception} StratumState
+Stratum.connect entry = do
+  sock   = TCP.connect entry.pool
+  _      = send sock (subscribeMsg "dgb-skein-miner/1.0.0")
+  subRes = recv sock
+  _      = send sock (authorizeMsg entry.wallet entry.worker entry.password)
+  authRes = recv sock
+  parseInitial subRes authRes sock
+
+-- Send a share to the pool
+Stratum.submit : StratumState -> StratumJob -> Bytes -> '{IO, Exception} ()
+Stratum.submit state job nonce2 = do
+  let msg = submitMsg
+        state.extraNonce1
+        nonce2
+        job.ntime
+        job.jobId
+  send state.socket msg
+
+-- JSON-RPC message builders
+subscribeMsg : Text -> Text
+subscribeMsg version =
+  """{ "id": 1, "method": "mining.subscribe", "params": [""" ++ version ++ """] }"""
+
+authorizeMsg : Text -> Text -> Text -> Text
+authorizeMsg wallet worker pass =
+  """{ "id": 2, "method": "mining.authorize", "params": [""" ++ worker ++ "." ++ wallet ++ "\", \"" ++ pass ++ "\"] }"""
+
+submitMsg : Bytes -> Bytes -> Nat32 -> Text -> Text
+submitMsg en1 en2 ntime jobId =
+  """{ "id": 4, "method": "mining.submit", "params": [""" ++ Bytes.toHex en1 ++ Bytes.toHex en2 ++ "\", \"" ++ jobId ++ "\", \"" ++ Nat32.toHex ntime ++ "\"] }"""

@@ -1,0 +1,45 @@
+-- dgb-skein-miner :: Stats.u
+-- Tracks hashrate, accepted/rejected shares, uptime.
+-- Optionally exposes a minimal HTTP stats API (--api-port).
+
+use Config
+
+type MinerStats = {
+  startTime       : Nat,
+  hashesComputed  : Nat,
+  sharesAccepted  : Nat,
+  sharesRejected  : Nat,
+  currentHashrate : Float
+}
+
+Stats.init : Config -> '{IO} ()
+Stats.init cfg = do
+  state = Ref.new {
+    startTime      = Time.now (),
+    hashesComputed = 0,
+    sharesAccepted = 0,
+    sharesRejected = 0,
+    currentHashrate = 0.0
+  }
+  match cfg.apiPort with
+    Some port -> startApiServer state port
+    None      -> ()
+
+Stats.recordShare : () -> '{IO} ()
+Stats.recordShare _ = do
+  -- Increment accepted share count
+  s = Ref.get state
+  Ref.set state { s | sharesAccepted = s.sharesAccepted + 1 }
+
+Stats.printStatus : MinerStats -> '{IO} ()
+Stats.printStatus s = do
+  let rate = formatHashrate s.currentHashrate
+  IO.println ("[dgb-skein-miner] Hashrate: " ++ rate
+    ++ " | Accepted: " ++ Nat.toText s.sharesAccepted
+    ++ " | Rejected: " ++ Nat.toText s.sharesRejected)
+
+formatHashrate : Float -> Text
+formatHashrate h =
+  if h >= 1_000_000.0      then Float.toText (h / 1_000_000.0) ++ " MH/s"
+  else if h >= 1_000.0     then Float.toText (h / 1_000.0)     ++ " KH/s"
+  else                          Float.toText h                  ++ " H/s"

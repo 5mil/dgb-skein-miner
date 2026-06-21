@@ -1,0 +1,20 @@
+-- dgb-skein-miner :: Hash/Native.u
+-- Optional FFI hook for native Skein backend.
+-- If a native library is available, it will be used for higher throughput.
+-- Falls back to Hash.Skein (pure Unison) if not present.
+
+use Hash.Skein
+
+-- Try native first, fall back to pure Unison
+hash512 : Bytes -> Bytes
+hash512 input =
+  match nativeAvailable () with
+    true  -> nativeSkein512 input
+    false -> Hash.Skein.hash512 input
+
+-- Foreign function declaration (linked at compile time if native lib present)
+nativeSkein512 : Bytes -> Bytes
+nativeSkein512 = builtin
+
+nativeAvailable : () -> Boolean
+nativeAvailable = builtin

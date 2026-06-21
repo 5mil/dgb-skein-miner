@@ -1,0 +1,14 @@
+[
+  {
+    "pool": "stratum+tcp://sgb.mining-dutch.nl:3032",
+    "wallet": "YOUR_WALLET_ADDRESS",
+    "worker": "rig1",
+    "password": "x"
+  },
+  {
+    "pool": "stratum+tcp://backup.example.com:3032",
+    "wallet": "YOUR_WALLET_ADDRESS",
+    "worker": "rig1",
+    "password": "x"
+  }
+]
