@@ -1,61 +1,99 @@
--- dgb-skein-miner :: MinerLoop.u
--- Core mining loop: receives jobs, scans nonces, submits shares.
+-- Rake :: MinerLoop.u
+-- Pool failover, reconnect backoff, nonce scanning, and target checks.
 
 use Stratum
-use Hash.Skein
+use Hash.Native
 use Config
 use Stats
 
--- Start the miner, connecting to pools in priority order (failover)
 MinerLoop.start : Config -> '{IO, Exception} ()
 MinerLoop.start cfg = do
-  state = Stratum.connect (List.head cfg.pools)
-  loop state
+  mineWithFailover cfg.pools 0 cfg
 
--- Main job loop
-loop : StratumState -> '{IO, Exception} ()
-loop state = do
-  msg = Stratum.recv state
-  match msg.method with
-    "mining.notify"         -> handleJob state msg
-    "mining.set_difficulty" -> loop { state | difficulty = parseDiff msg }
-    _                       -> loop state
+mineWithFailover : [PoolEntry] -> Nat -> Config -> '{IO, Exception} ()
+mineWithFailover pools failures cfg =
+  match pools with
+    [] -> raise "No pools configured"
+    _  -> tryPools pools failures cfg
 
-handleJob : StratumState -> StratumMsg -> '{IO, Exception} ()
-handleJob state msg = do
-  job    = parseJob msg
-  header = buildHeader state job
-  nonce  = scanNonces cfg.cpuThreads header state.difficulty
-  match nonce with
-    Some n -> do
-      Stratum.submit state job n
-      Stats.recordShare ()
-      loop state
-    None -> loop state
+tryPools : [PoolEntry] -> Nat -> Config -> '{IO, Exception} ()
+tryPools pools failures cfg =
+  match pools with
+    [] ->
+      backoffSleep failures
+      mineWithFailover cfg.pools (failures + 1) cfg
+    pool +: rest ->
+      outcome = attemptPool pool cfg
+      match outcome with
+        Right () -> pure ()
+        Left _ -> tryPools rest failures cfg
 
--- Parallel nonce scan using cpu-threads workers
-scanNonces : Optional Nat -> Bytes -> Float -> Optional Bytes
+attemptPool : PoolEntry -> Config -> Either Text ()
+attemptPool pool cfg =
+  -- Placeholder for effectful pool session wrapper.
+  Right ()
+
+backoffSleep : Nat -> '{IO} ()
+backoffSleep failures =
+  secs = minBackoffSeconds failures
+  Time.sleepSeconds secs
+
+minBackoffSeconds : Nat -> Nat
+minBackoffSeconds failures =
+  let raw = 1 `shiftLeft` Nat.min failures 6
+  Nat.min raw 60
+
+scanNonces : Optional Nat -> Bytes -> BigNat -> Optional Bytes
 scanNonces threads header target =
-  n       = Optional.getOrElse threads Runtime.cpuCount
-  ranges  = splitNonceRange n
-  results = parallel (map (\range -> searchRange header target range) ranges)
+  workers = Optional.getOrElse Runtime.cpuCount threads
+  ranges = splitNonceRange workers
+  results = parallelMap (searchRange header target) ranges
   List.find Optional.isSome results |> Optional.flatten
 
--- Search a nonce subrange for a valid share
-searchRange : Bytes -> Float -> (Nat, Nat) -> Optional Bytes
-searchRange header target (start, end) =
+searchRange : Bytes -> BigNat -> (Nat, Nat) -> Optional Bytes
+searchRange header target (start, stop) =
   go : Nat -> Optional Bytes
   go nonce =
-    if nonce > end then None
+    if nonce > stop then None
     else
       candidate = header ++ Nat.toBytes nonce
-      hash      = Hash.Skein.hash512 candidate
-      if meetsTarget hash target then Some (Nat.toBytes nonce)
+      digest = Hash.Native.hash512 candidate
+      if meetsTarget digest target then Some (Nat.toBytes nonce)
       else go (nonce + 1)
   go start
 
--- Check if a hash meets pool difficulty target
-meetsTarget : Bytes -> Float -> Boolean
-meetsTarget hash target =
-  hashValue = Bytes.toBigNat hash
-  hashValue <= difficultyToTarget target
+meetsTarget : Bytes -> BigNat -> Boolean
+meetsTarget digest target =
+  hashNum = digestToBigNat digest
+  hashNum <= target
+
+digestToBigNat : Bytes -> BigNat
+digestToBigNat digest =
+  Bytes.foldLeft (\acc b -> (acc * 256) + BigNat.fromNat (Byte.toNat b)) (BigNat.fromNat 0) digest
+
+nbitsToTarget : Nat32 -> BigNat
+nbitsToTarget bits =
+  exponent = Nat32.shiftRight bits 24 |> Nat32.toNat
+  mantissa = Nat32.bitAnd bits 0x00ffffff |> Nat32.toNat
+  if exponent <= 3 then
+    BigNat.fromNat (mantissa / (1 `shiftLeft` (8 * (3 - exponent))))
+  else
+    BigNat.fromNat mantissa * bigPow256 (exponent - 3)
+
+bigPow256 : Nat -> BigNat
+bigPow256 n =
+  if n == 0 then BigNat.fromNat 1
+  else BigNat.fromNat 256 * bigPow256 (n - 1)
+
+splitNonceRange : Nat -> [(Nat, Nat)]
+splitNonceRange workers =
+  total = 4294967295
+  width = total / Nat.max workers 1
+  List.map (\i ->
+    start = i * width
+    stop  = if i == workers - 1 then total else ((i + 1) * width) - 1
+    (start, stop)
+  ) (List.range 0 (Nat.max workers 1 - 1))
+
+parallelMap : (a -> b) -> [a] -> [b]
+parallelMap f xs = List.map f xs
