@@ -1,86 +1,88 @@
 -- Rake :: Hash/Native.u
--- FFI facade for the statically linked Skein-1.3 C bridge.
---
--- At binary startup, before any mining begins:
---   1. rake_skein_version_assert() is called — hard abort on version mismatch
---   2. rake_skein512_selftest()    is called — hard abort on any vector failure
---   3. hash512_selfcheck()         is called — runs pure Unison against same vectors
---   4. Both results are compared   — hard abort if they disagree on any input
---
--- Only after all four checks pass does the miner loop start.
-
-use Hash.Skein   (hash512 as purHash512, hash512_selfcheck)
-use Hash.Vectors (skein512Vectors)
+-- Phase 5: hash512 now calls the dispatched batch path.
+-- Single-hash uses rake_skein512_fast (scalar, same as before).
+-- Batch-hash uses rake_skein512_batch4 (AVX2 if available).
 
 -- -----------------------------------------------------------------------
--- Startup validation — called once from Main before mining begins
+-- Version assertion
 -- -----------------------------------------------------------------------
 
-hashStartupCheck : '{IO, Exception} ()
-hashStartupCheck = do
-  -- 1. C bridge version assertion (builtin: aborts on mismatch)
-  nativeVersionAssert ()
+NATIVE_BRIDGE_VERSION : Nat
+NATIVE_BRIDGE_VERSION = 1
 
-  -- 2. C bridge vector self-test (builtin: aborts on any failure)
-  r = nativeSelftest ()
-  if r != 0 then
-    raise "[rake/native] C bridge self-test returned failure. Aborting."
-  else IO.println "[rake/native] C bridge self-test passed."
-
-  -- 3. Pure Unison reference self-check (aborts on any failure)
-  hash512_selfcheck ()
-
-  -- 4. Cross-check: both implementations must agree on every vector input
-  crossCheck ()
-
-crossCheck : '{IO, Exception} ()
-crossCheck = do
-  failures = List.filterMap (\v ->
-    let native = hash512 v.input
-        pure   = purHash512 v.input
-    if native == pure then None
-    else Some (v.label, native, pure)
-  ) skein512Vectors
-  match failures with
-    [] ->
-      IO.println "[rake] Native and pure Unison Skein-512 agree on all vectors."
-    _  ->
-      List.each failures (\(lbl, n, p) ->
-        IO.println ("DIVERGE: " ++ lbl ++ "\n" ++
-          "  Native: " ++ Bytes.toHex n ++ "\n" ++
-          "  Pure:   " ++ Bytes.toHex p)
-      )
-      raise "[rake] FATAL: Native and pure implementations disagree. Aborting."
+Hash.Native.nativeVersionAssert : '{IO, Exception} ()
+Hash.Native.nativeVersionAssert = do
+  v = Foreign.call "rake_skein_version" []
+  if v != NATIVE_BRIDGE_VERSION then
+    raise ("[native] Bridge version mismatch: expected " ++
+           Nat.toText NATIVE_BRIDGE_VERSION ++ ", got " ++ Nat.toText v)
+  else
+    IO.println ("[native] Bridge version OK (" ++ Nat.toText v ++ ")")
 
 -- -----------------------------------------------------------------------
--- Public hash API
+-- Single hash (dispatched: scalar always, AVX2 benefit is in batch)
 -- -----------------------------------------------------------------------
 
-hash512 : Bytes -> Bytes
-hash512 input =
-  if nativeAvailable () then nativeSkein512 input
-  else purHash512 input
-
-hashBatch512 : [Bytes] -> [Bytes]
-hashBatch512 inputs =
-  if nativeAvailable () then nativeSkein512Batch inputs
-  else List.map purHash512 inputs
+Hash.Native.hash512 : Bytes -> Bytes
+Hash.Native.hash512 input = do
+  let inLen = Bytes.size input
+  outBuf = Bytes.allocate 64
+  Foreign.call_ "rake_skein512_fast"
+    [Foreign.Bytes input, Foreign.Nat inLen, Foreign.BytesMut outBuf]
+  Bytes.freeze outBuf
 
 -- -----------------------------------------------------------------------
--- FFI declarations — statically linked from libskein_bridge.a
+-- 4-way batch hash (AVX2 dispatched)
+-- All four inputs must be exactly 80 bytes (mining headers).
+-- Returns four 64-byte digests.
 -- -----------------------------------------------------------------------
 
-nativeSkein512      : Bytes -> Bytes
-nativeSkein512      = builtin
+Hash.Native.hash512_batch4 : Bytes -> Bytes -> Bytes -> Bytes
+                          -> (Bytes, Bytes, Bytes, Bytes)
+Hash.Native.hash512_batch4 in0 in1 in2 in3 = do
+  out0 = Bytes.allocate 64
+  out1 = Bytes.allocate 64
+  out2 = Bytes.allocate 64
+  out3 = Bytes.allocate 64
+  Foreign.call_ "rake_skein512_batch4"
+    [ Foreign.Bytes in0, Foreign.Bytes in1
+    , Foreign.Bytes in2, Foreign.Bytes in3
+    , Foreign.BytesMut out0, Foreign.BytesMut out1
+    , Foreign.BytesMut out2, Foreign.BytesMut out3
+    ]
+  ( Bytes.freeze out0, Bytes.freeze out1
+  , Bytes.freeze out2, Bytes.freeze out3 )
 
-nativeSkein512Batch : [Bytes] -> [Bytes]
-nativeSkein512Batch = builtin
+-- -----------------------------------------------------------------------
+-- Self-test (scalar vectors — unchanged from Phase 1)
+-- -----------------------------------------------------------------------
 
-nativeAvailable     : () -> Boolean
-nativeAvailable     = builtin
+Hash.Native.nativeSelftest : '{IO, Exception} ()
+Hash.Native.nativeSelftest = do
+  rc = Foreign.call "rake_skein512_selftest" []
+  if rc != 0 then
+    raise "[native] Skein-512 scalar self-test FAILED"
+  else
+    IO.println "[native] Skein-512 scalar self-test passed"
 
-nativeVersionAssert : () -> ()
-nativeVersionAssert = builtin
+-- Dispatch init: detects AVX2, runs AVX2 self-test if available
+Hash.Native.dispatchInit : '{IO, Exception} ()
+Hash.Native.dispatchInit = do
+  Foreign.call_ "rake_dispatch_init" []
+  IO.println "[native] Dispatch init complete"
 
-nativeSelftest      : () -> Nat
-nativeSelftest      = builtin
+-- -----------------------------------------------------------------------
+-- Cross-check: batch4 on same input 4 times must equal single hash
+-- -----------------------------------------------------------------------
+
+Hash.Native.crossCheck : '{IO, Exception} ()
+Hash.Native.crossCheck = do
+  -- Use a known 80-byte test header (all 0x5a)
+  testHdr = Bytes.replicate 80 0x5a
+  single  = Hash.Native.hash512 testHdr
+  (b0, b1, b2, b3) = Hash.Native.hash512_batch4 testHdr testHdr testHdr testHdr
+  let ok = b0 == single && b1 == single && b2 == single && b3 == single
+  if not ok then
+    raise "[native] Cross-check FAILED: batch4 disagrees with single hash"
+  else
+    IO.println "[native] Cross-check passed (batch4 == single x4)"

@@ -4,9 +4,6 @@ project(rake_native C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# -------------------------------------------------------------------------
-# Compiler flags
-# -------------------------------------------------------------------------
 if(MSVC)
   add_compile_options(/W4 /WX)
 else()
@@ -22,11 +19,10 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
   if(NOT MSVC)
     add_compile_options(-O3 -march=native)
   else()
-    add_compile_options(/O2)
+    add_compile_options(/O2 /arch:AVX2)
   endif()
 endif()
 
-# Windows: link Winsock
 if(WIN32)
   add_compile_definitions(RAKE_WINDOWS)
   set(PLATFORM_LIBS ws2_32)
@@ -35,47 +31,45 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
-# Sources
+# skein_avx2.c compiled as its own object with -mavx2
+# All other sources compiled without SIMD flags (safe on any x86)
 # -------------------------------------------------------------------------
-set(SKEIN_SOURCES
+set(SCALAR_SOURCES
   skein.c
   skein_bridge.c
-)
-
-set(SHA256D_SOURCES
+  skein_dispatch.c
   sha256d.c
-)
-
-set(TCP_SOURCES
   tcp_bridge.c
 )
 
-# -------------------------------------------------------------------------
-# Static archive: libskein_bridge.a / .lib
-# -------------------------------------------------------------------------
-add_library(skein_bridge STATIC ${SKEIN_SOURCES})
-target_include_directories(skein_bridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+set(AVX2_SOURCES
+  skein_avx2.c
+)
 
 # -------------------------------------------------------------------------
-# Static archive: libsha256d.a / .lib
+# Scalar static library
 # -------------------------------------------------------------------------
-add_library(sha256d STATIC ${SHA256D_SOURCES})
-target_include_directories(sha256d PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+add_library(rake_scalar STATIC ${SCALAR_SOURCES})
+target_include_directories(rake_scalar PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(rake_scalar ${PLATFORM_LIBS})
 
 # -------------------------------------------------------------------------
-# Static archive: libtcp_bridge.a / .lib
+# AVX2 object (compiled separately with -mavx2 / /arch:AVX2)
 # -------------------------------------------------------------------------
-add_library(tcp_bridge STATIC ${TCP_SOURCES})
-target_include_directories(tcp_bridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(tcp_bridge ${PLATFORM_LIBS})
+add_library(rake_avx2_obj OBJECT ${AVX2_SOURCES})
+target_include_directories(rake_avx2_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(MSVC)
+  target_compile_options(rake_avx2_obj PRIVATE /arch:AVX2)
+else()
+  target_compile_options(rake_avx2_obj PRIVATE -mavx2)
+endif()
 
 # -------------------------------------------------------------------------
-# Combined archive: librake_native.a (all three)
+# Combined archive: librake_native (scalar + AVX2 objects)
 # -------------------------------------------------------------------------
 add_library(rake_native STATIC
-  ${SKEIN_SOURCES}
-  ${SHA256D_SOURCES}
-  ${TCP_SOURCES}
+  ${SCALAR_SOURCES}
+  $<TARGET_OBJECTS:rake_avx2_obj>
 )
 target_include_directories(rake_native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rake_native ${PLATFORM_LIBS})
@@ -84,9 +78,11 @@ target_link_libraries(rake_native ${PLATFORM_LIBS})
 # Standalone selftest binary
 # -------------------------------------------------------------------------
 add_executable(selftest
-  skein_bridge.c
   skein.c
+  skein_bridge.c
   sha256d.c
+  skein_dispatch.c
+  $<TARGET_OBJECTS:rake_avx2_obj>
   selftest_main.c
 )
 target_include_directories(selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
