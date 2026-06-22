@@ -17,23 +17,15 @@ static const int R512[8][4] = {
 };
 
 /* Word permutation pi, Nw=8.
- * The Skein/Threefish spec defines pi as a SCATTER:
- *   output word PI8[i] = input word i
- * i.e. t[PI8[i]] = v[i], NOT t[i] = v[PI8[i]].
- * PI8 = [2,1,4,7,6,5,0,3] means:
- *   v[0]->t[2], v[1]->t[1], v[2]->t[4], v[3]->t[7],
- *   v[4]->t[6], v[5]->t[5], v[6]->t[0], v[7]->t[3]
+ * PI8[i] = destination of word i.
+ * Applied as gather: t[i] = v[PI8[i]]  (equivalent to v -> t where t[i] <- v[PI8[i]])
+ * PI8 = {2,1,4,7,6,5,0,3}
  */
 static const int PI8[8] = {2, 1, 4, 7, 6, 5, 0, 3};
 
 #define C240     UINT64_C(0x1BD11BDAA9FC1A22)
 #define ROTL64(v,n) (((v) << (n)) | ((v) >> (64-(n))))
 
-/* -----------------------------------------------------------------------
- * Threefish-512 encrypt.
- * key[0..8]: key words, key[8] = C240 ^ key[0..7] (caller pre-computes)
- * tw[0..2]:  tweak words, tw[2] = tw[0]^tw[1] (caller pre-computes)
- * ----------------------------------------------------------------------- */
 static void threefish512(
     const uint64_t key[9],
     const uint64_t tw[3],
@@ -48,24 +40,22 @@ static void threefish512(
     v[4] += key[4];
     v[5] += key[5] + tw[0];
     v[6] += key[6] + tw[1];
-    v[7] += key[7]; /* + s=0, omitted */
+    v[7] += key[7];
 
     for (int d = 0; d < 72; d++) {
-        /* Mix: 4 pairs (0,1),(2,3),(4,5),(6,7) */
         const int *rc = R512[d & 7];
         v[0] += v[1]; v[1] = ROTL64(v[1], rc[0]) ^ v[0];
         v[2] += v[3]; v[3] = ROTL64(v[3], rc[1]) ^ v[2];
         v[4] += v[5]; v[5] = ROTL64(v[5], rc[2]) ^ v[4];
         v[6] += v[7]; v[7] = ROTL64(v[7], rc[3]) ^ v[6];
 
-        /* Permute: SCATTER -- output[PI8[i]] = input[i] */
+        /* Permute (gather) */
         uint64_t t[8];
-        for (int i = 0; i < 8; i++) t[PI8[i]] = v[i];
+        for (int i = 0; i < 8; i++) t[i] = v[PI8[i]];
         for (int i = 0; i < 8; i++) v[i] = t[i];
 
-        /* Subkey injection every 4 rounds (after rounds 3,7,11,...,71) */
         if ((d & 3) == 3) {
-            unsigned s = (unsigned)(d + 1) >> 2;   /* s = 1..18 */
+            unsigned s = (unsigned)(d + 1) >> 2;
             v[0] += key[ s    % 9];
             v[1] += key[(s+1) % 9];
             v[2] += key[(s+2) % 9];
@@ -79,9 +69,6 @@ static void threefish512(
     for (int i = 0; i < 8; i++) ct[i] = v[i];
 }
 
-/* -----------------------------------------------------------------------
- * UBI block processing (one 64-byte block).
- * ----------------------------------------------------------------------- */
 static void ubi_block(
     Skein_512_Ctxt_t *ctx,
     const uint8_t    *blk,
@@ -107,7 +94,6 @@ static void ubi_block(
     threefish512(key, ctx->T, pt, ct);
 
     for (int i = 0; i < 8; i++) ctx->X[i] = ct[i] ^ pt[i];
-
     ctx->T[1] &= ~SKEIN_T1_POS_FIRST;
 }
 
