@@ -1,0 +1,121 @@
+-- Rake :: Platform/Tcp.u
+-- Real TCP socket bindings via native/tcp_bridge.c.
+-- Replaces all placeholder stubs in Stratum.u and Api.u.
+--
+-- The Socket type wraps a C file descriptor (Nat).
+-- All operations are blocking; callers run in their own Thread.
+
+-- -----------------------------------------------------------------------
+-- Types
+-- -----------------------------------------------------------------------
+
+type Socket     = Socket Nat   -- wraps a TCP fd
+type TcpListener = TcpListener Nat   -- wraps a listening fd
+type TcpConn     = TcpConn Nat       -- wraps an accepted client fd
+
+-- Receive buffer size: 8 KB is more than enough for Stratum lines
+RECV_BUF_SIZE : Nat
+RECV_BUF_SIZE = 8192
+
+-- Connect timeout: 10 seconds
+CONNECT_TIMEOUT_MS : Nat
+CONNECT_TIMEOUT_MS = 10000
+
+-- -----------------------------------------------------------------------
+-- Client socket operations
+-- -----------------------------------------------------------------------
+
+-- Connect to "host:port". Raises on failure.
+tcpConnect : Text -> '{IO, Exception} Socket
+tcpConnect endpoint = do
+  fd = Foreign.call "rake_tcp_connect"
+         [Foreign.Text endpoint, Foreign.Nat CONNECT_TIMEOUT_MS]
+  if fd < 0 then
+    raise ("[tcp] Failed to connect to " ++ endpoint)
+  else
+    pure (Socket (Nat.fromInt fd))
+
+-- Send a line (appends \n). Raises on failure.
+tcpSendLine : Socket -> Text -> '{IO, Exception} ()
+tcpSendLine (Socket fd) line = do
+  let bytes = Text.toUtf8 (line ++ "\n")
+  rc = Foreign.call "rake_tcp_send"
+         [Foreign.Nat fd, Foreign.Bytes bytes, Foreign.Nat (Bytes.size bytes)]
+  if rc < 0 then raise "[tcp] send failed"
+  else pure ()
+
+-- Blocking recv; returns raw chunk as Text (UTF-8).
+-- Returns "" on clean close (pool disconnected).
+tcpRecv : Socket -> '{IO, Exception} Text
+tcpRecv (Socket fd) = do
+  buf  = Bytes.allocate RECV_BUF_SIZE
+  n    = Foreign.call "rake_tcp_recv"
+           [Foreign.Nat fd, Foreign.BytesMut buf, Foreign.Nat RECV_BUF_SIZE]
+  if n < 0 then raise "[tcp] recv failed"
+  else if n == 0 then pure ""   -- clean close
+  else pure (Text.fromUtf8 (Bytes.take n buf))
+
+tcpClose : Socket -> '{IO} ()
+tcpClose (Socket fd) =
+  Foreign.call_ "rake_tcp_close" [Foreign.Nat fd]
+
+-- -----------------------------------------------------------------------
+-- Server socket operations (API port)
+-- -----------------------------------------------------------------------
+
+type HttpRequest = { path : Text, method : Text }
+
+-- Open a listening socket on the given port.
+tcpListen : Nat -> '{IO, Exception} TcpListener
+tcpListen port = do
+  fd = Foreign.call "rake_tcp_listen" [Foreign.Nat port, Foreign.Nat 16]
+  if fd < 0 then raise ("[tcp] Failed to listen on port " ++ Nat.toText port)
+  else pure (TcpListener (Nat.fromInt fd))
+
+-- Accept one connection (blocking).
+tcpAccept : TcpListener -> '{IO, Exception} TcpConn
+tcpAccept (TcpListener fd) = do
+  client = Foreign.call "rake_tcp_accept" [Foreign.Nat fd]
+  if client < 0 then raise "[tcp] accept failed"
+  else pure (TcpConn (Nat.fromInt client))
+
+-- Read a minimal HTTP/1.x request line and parse the path.
+-- Reads until \r\n\r\n (end of headers); ignores body.
+readHttpRequest : TcpConn -> '{IO, Exception} HttpRequest
+readHttpRequest conn@(TcpConn fd) = do
+  raw = recvUntilHeaders conn ""
+  -- Parse "GET /path HTTP/1.x"
+  match Text.words raw with
+    method +: path +: _ -> pure { path = path, method = method }
+    _                   -> pure { path = "/", method = "GET" }
+
+recvUntilHeaders : TcpConn -> Text -> '{IO, Exception} Text
+recvUntilHeaders conn@(TcpConn fd) acc = do
+  chunk = tcpRecv (Socket fd)
+  let acc2 = acc ++ chunk
+  if Text.contains "\r\n\r\n" acc2 || Text.contains "\n\n" acc2 then
+    pure acc2
+  else if Text.isEmpty chunk then pure acc2  -- connection closed
+  else recvUntilHeaders conn acc2
+
+-- Write a minimal HTTP/1.x 200 response with JSON body.
+writeHttpResponse : TcpConn -> Nat -> Text -> '{IO, Exception} ()
+writeHttpResponse (TcpConn fd) statusCode body = do
+  let statusText = if statusCode == 200 then "OK" else "Error"
+      bodyBytes  = Text.toUtf8 body
+      bodyLen    = Bytes.size bodyBytes
+      headers    = "HTTP/1.1 " ++ Nat.toText statusCode ++ " " ++ statusText ++ "\r\n"
+                ++ "Content-Type: application/json\r\n"
+                ++ "Content-Length: " ++ Nat.toText bodyLen ++ "\r\n"
+                ++ "Access-Control-Allow-Origin: *\r\n"
+                ++ "Connection: close\r\n"
+                ++ "\r\n"
+      full       = headers ++ body
+      bytes      = Text.toUtf8 full
+  rc = Foreign.call "rake_tcp_send"
+         [Foreign.Nat fd, Foreign.Bytes bytes, Foreign.Nat (Bytes.size bytes)]
+  if rc < 0 then raise "[tcp] response write failed"
+  else pure ()
+
+tcpConnClose : TcpConn -> '{IO} ()
+tcpConnClose (TcpConn fd) = tcpClose (Socket fd)

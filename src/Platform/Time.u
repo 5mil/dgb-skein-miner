@@ -1,0 +1,60 @@
+-- Rake :: Platform/Time.u
+-- Real UTC timestamp formatting for Log.u.
+-- Converts epoch milliseconds to "YYYY-MM-DD HH:MM:SS" via
+-- pure calendar decomposition (no locale, no libc strftime dependency).
+
+-- -----------------------------------------------------------------------
+-- Top-level: format epoch millis as UTC timestamp string
+-- -----------------------------------------------------------------------
+
+formatTimestamp : Nat -> Text
+formatTimestamp ms =
+  secs = ms / 1000
+  (y, mo, d)    = epochToYMD secs
+  (h, mi, s)    = epochToHMS secs
+  pad2 n = if n < 10 then "0" ++ Nat.toText n else Nat.toText n
+  pad4 n = if n < 1000 then "0" ++ pad3 n else Nat.toText n
+  pad3 n = if n < 100  then "0" ++ pad2 n else Nat.toText n
+  pad4 y ++ "-" ++ pad2 mo ++ "-" ++ pad2 d
+    ++ " " ++ pad2 h ++ ":" ++ pad2 mi ++ ":" ++ pad2 s
+
+-- -----------------------------------------------------------------------
+-- Calendar decomposition
+-- Pure integer arithmetic — no stdlib dependency.
+-- Algorithm: days since Unix epoch (1970-01-01) -> Gregorian date.
+-- -----------------------------------------------------------------------
+
+epochToHMS : Nat -> (Nat, Nat, Nat)
+epochToHMS secs =
+  daySecs = secs `Nat.mod` 86400
+  h  = daySecs / 3600
+  mi = (daySecs `Nat.mod` 3600) / 60
+  s  = daySecs `Nat.mod` 60
+  (h, mi, s)
+
+epochToYMD : Nat -> (Nat, Nat, Nat)
+epochToYMD secs =
+  -- Days since 1970-01-01
+  days = secs / 86400
+  -- 400-year Gregorian cycle = 146097 days
+  -- Shift epoch to 0000-03-01 to simplify leap-year handling
+  -- (algorithm by Howard Hinnant, public domain)
+  z    = days + 719468
+  era  = z / 146097
+  doe  = z `Nat.mod` 146097                          -- day of era [0, 146096]
+  yoe  = (doe - doe/1460 + doe/36524 - doe/146096) / 365  -- year of era [0, 399]
+  y0   = yoe + era * 400
+  doy  = doe - (365*yoe + yoe/4 - yoe/100)           -- day of year [0, 365]
+  mp   = (5*doy + 2) / 153                            -- month of year (March=0)
+  d    = doy - (153*mp + 2)/5 + 1                     -- day [1, 31]
+  mo   = if mp < 10 then mp + 3 else mp - 9           -- month [1, 12]
+  y    = if mo <= 2 then y0 + 1 else y0               -- year
+  (y, mo, d)
+
+-- -----------------------------------------------------------------------
+-- Exported for Log.u (replaces the (ts:N) placeholder)
+-- -----------------------------------------------------------------------
+
+-- Re-export under the name Log.u uses
+Platform.Time.formatTimestamp : Nat -> Text
+Platform.Time.formatTimestamp = formatTimestamp
