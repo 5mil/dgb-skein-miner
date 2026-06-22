@@ -31,8 +31,7 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
-# skein_avx2.c compiled as its own object with -mavx2
-# All other sources compiled without SIMD flags (safe on any x86)
+# skein_avx2.c compiled with -mavx2; everything else is plain scalar
 # -------------------------------------------------------------------------
 set(SCALAR_SOURCES
   skein.c
@@ -40,6 +39,8 @@ set(SCALAR_SOURCES
   skein_dispatch.c
   sha256d.c
   tcp_bridge.c
+  yescrypt.c
+  yescryptr16_bridge.c
 )
 
 set(AVX2_SOURCES
@@ -65,7 +66,7 @@ else()
 endif()
 
 # -------------------------------------------------------------------------
-# Combined archive: librake_native (scalar + AVX2 objects)
+# Combined archive: librake_native
 # -------------------------------------------------------------------------
 add_library(rake_native STATIC
   ${SCALAR_SOURCES}
@@ -82,6 +83,8 @@ add_executable(selftest
   skein_bridge.c
   sha256d.c
   skein_dispatch.c
+  yescrypt.c
+  yescryptr16_bridge.c
   $<TARGET_OBJECTS:rake_avx2_obj>
   selftest_main.c
 )

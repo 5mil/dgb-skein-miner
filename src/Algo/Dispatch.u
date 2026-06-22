@@ -1,0 +1,48 @@
+-- Rake :: Algo/Dispatch.u
+-- Algorithm dispatch: selects hash function from Config.algo.
+--
+-- Supported algorithms:
+--   "skein"       -> Hash.Native.hash512   (64-byte digest, Skein-512)
+--   "yescryptr16" -> YescryptR16.hash      (32-byte digest, yescrypt)
+--
+-- The worker layer calls Algo.Dispatch.hashHeader which returns
+-- Bytes (variable length depending on algo).
+-- Target.meetsTarget works on both because it compares the first
+-- 32 bytes (big-endian) against the 32-byte target regardless of
+-- total digest length.
+
+type AlgoId = Skein | YescryptR16
+
+Algo.parseId : Text -> Either Text AlgoId
+Algo.parseId = cases
+  "skein"       -> Right Skein
+  "yescryptr16" -> Right YescryptR16
+  other         -> Left ("Unknown algorithm: '" ++ other ++ "'. Supported: skein, yescryptr16")
+
+Algo.hashHeader : AlgoId -> Bytes -> Bytes
+Algo.hashHeader algo header =
+  match algo with
+    Skein        -> Hash.Native.hash512 header
+    YescryptR16  -> YescryptR16.hash header
+
+-- 4-way batch (AVX2 path only meaningful for Skein;
+-- yescrypt is memory-hard so batching within one thread is not beneficial).
+-- Workers still call this uniformly; yescrypt falls back to 4x single.
+Algo.hashBatch4 : AlgoId -> Bytes -> Bytes -> Bytes -> Bytes
+               -> (Bytes, Bytes, Bytes, Bytes)
+Algo.hashBatch4 algo h0 h1 h2 h3 =
+  match algo with
+    Skein ->
+      Hash.Native.hash512_batch4 h0 h1 h2 h3
+    YescryptR16 ->
+      ( YescryptR16.hash h0
+      , YescryptR16.hash h1
+      , YescryptR16.hash h2
+      , YescryptR16.hash h3
+      )
+
+-- Run algorithm-specific self-tests
+Algo.selftest : AlgoId -> '{IO, Exception} ()
+Algo.selftest = cases
+  Skein       -> Hash.Native.nativeSelftest
+  YescryptR16 -> YescryptR16.selftest

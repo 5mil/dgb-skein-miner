@@ -1,102 +1,57 @@
 -- Rake :: Config.u
--- Resolves final Config from parsed CLI args + JSON config/pools files.
--- Precedence: CLI flags > config.json > built-in defaults.
-
-use Args (ParsedArgs)
-
-type Algorithm = Skein
+-- Configuration types and CLI parsing.
+-- Added: algo field ("skein" | "yescryptr16"), default "skein".
 
 type PoolEntry = {
-  pool     : Text,
+  pool     : Text,   -- "host:port"
   wallet   : Text,
   worker   : Text,
   password : Text
 }
 
 type Config = {
-  algorithm  : Algorithm,
-  pools      : [PoolEntry],
-  cpuThreads : Optional Nat,
-  disableGpu : Boolean,
-  disableCpu : Boolean,
-  tls        : Boolean,
-  logFile    : Optional Text,
-  apiPort    : Optional Nat,
-  background : Boolean
+  pool       : PoolEntry,
+  threads    : Nat,
+  algo       : Text,   -- "skein" or "yescryptr16"
+  apiPort    : Nat,
+  verbose    : Boolean
 }
 
--- Default pool entry using prefilled credentials
-defaultPool : PoolEntry
-defaultPool = {
-  pool     = "stratum+tcp://sgb.mining-dutch.nl:3032",
-  wallet   = "5mil",
-  worker   = "5mil.worker55",
-  password = "x"
+Config.default : Config
+Config.default = {
+  pool    = { pool = "stratum.digibyte.org:3443", wallet = "", worker = "rake", password = "x" },
+  threads = 4,
+  algo    = "skein",
+  apiPort = 4067,
+  verbose = false
 }
 
--- Build Config from ParsedArgs, merging config file values underneath
-Config.fromParsed : ParsedArgs -> Config
-Config.fromParsed parsed =
-  -- Load JSON config file if specified (or default config.json)
-  cfgPath  = Optional.getOrElse "config.json" parsed.configFile
-  fileCfg  = JSON.readFileSafe cfgPath
+Config.parse : [Text] -> Either Text Config
+Config.parse args =
+  go Config.default args
+  where
+    go cfg = cases
+      [] -> Right cfg
+      "--pool"    +: v +: rest -> go { cfg | pool    = { cfg.pool | pool   = v } } rest
+      "--wallet"  +: v +: rest -> go { cfg | pool    = { cfg.pool | wallet = v } } rest
+      "--worker"  +: v +: rest -> go { cfg | pool    = { cfg.pool | worker = v } } rest
+      "--password"+: v +: rest -> go { cfg | pool    = { cfg.pool | password = v } } rest
+      "--threads" +: v +: rest ->
+        match Nat.fromText v with
+          Some n -> go { cfg | threads = n } rest
+          None   -> Left ("Invalid --threads value: " ++ v)
+      "--algo"    +: v +: rest -> go { cfg | algo    = v } rest
+      "--api-port"+: v +: rest ->
+        match Nat.fromText v with
+          Some n -> go { cfg | apiPort = n } rest
+          None   -> Left ("Invalid --api-port value: " ++ v)
+      "--verbose" +: rest -> go { cfg | verbose = true } rest
+      other +: _ -> Left ("Unknown flag: " ++ other)
 
-  -- Pool from CLI or file or default
-  pool = {
-    pool     = parsed.pool     |> orFile fileCfg "pool"     |> Optional.getOrElse defaultPool.pool,
-    wallet   = parsed.wallet   |> orFile fileCfg "wallet"   |> Optional.getOrElse defaultPool.wallet,
-    worker   = parsed.worker   |> orFile fileCfg "worker"   |> Optional.getOrElse defaultPool.worker,
-    password = parsed.password |> orFile fileCfg "password" |> Optional.getOrElse defaultPool.password
-  }
-
-  -- Failover pools from --pools-file (or pools.json)
-  poolsPath    = parsed.poolsFile |> Optional.getOrElse "pools.json"
-  extraPools   = JSON.readPoolsFileSafe poolsPath
-  allPools     = [pool] ++ extraPools
-
-  {
-    algorithm  = parseAlgo (parsed.algorithm |> orFile fileCfg "algorithm" |> Optional.getOrElse "skein"),
-    pools      = allPools,
-    cpuThreads = parsed.cpuThreads |> orFileNat fileCfg "cpu-threads",
-    disableGpu = parsed.disableGpu,
-    disableCpu = parsed.disableCpu,
-    tls        = parsed.tls |> orFileBool fileCfg "tls" |> Optional.getOrElse false,
-    logFile    = parsed.logFile |> orFile fileCfg "log-file",
-    apiPort    = parsed.apiPort |> orFileNat fileCfg "api-port",
-    background = parsed.background
-  }
-
--- Validate required fields, return Left with missing field name on failure
 Config.validate : Config -> Either Text Config
 Config.validate cfg =
-  match cfg.pools with
-    [] -> Left "pool (no pool entries found)"
-    (p +: _) ->
-      if Text.isEmpty p.pool   then Left "--pool"
-      else if Text.isEmpty p.wallet then Left "--wallet"
-      else Right cfg
-
--- Parse algorithm name to ADT
-parseAlgo : Text -> Algorithm
-parseAlgo = cases
-  "skein" -> Skein
-  _       -> Skein   -- default to Skein; extend for future algorithms
-
--- Helpers: prefer CLI Optional, fall back to JSON file value
-orFile : Optional (Map Text JSON) -> Text -> Optional Text -> Optional Text
-orFile file key cli =
-  match cli with
-    Some v -> Some v
-    None   -> file |> Optional.flatMap (Map.lookup key) |> Optional.flatMap JSON.asText
-
-orFileBool : Optional (Map Text JSON) -> Text -> Optional Boolean -> Optional Boolean
-orFileBool file key cli =
-  match cli with
-    Some v -> Some v
-    None   -> file |> Optional.flatMap (Map.lookup key) |> Optional.flatMap JSON.asBool
-
-orFileNat : Optional (Map Text JSON) -> Text -> Optional Nat -> Optional Nat
-orFileNat file key cli =
-  match cli with
-    Some v -> Some v
-    None   -> file |> Optional.flatMap (Map.lookup key) |> Optional.flatMap JSON.asNat
+  if Text.isEmpty cfg.pool.wallet then
+    Left "--wallet is required"
+  else match Algo.parseId cfg.algo with
+    Left err -> Left err
+    Right _  -> Right cfg

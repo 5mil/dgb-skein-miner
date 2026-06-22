@@ -1,14 +1,13 @@
 -- Rake :: Worker.u
--- Phase 5 update: nonce scan uses hash512_batch4 (AVX2) in groups of 4.
--- Falls back to single hash512 for the tail (nonce count % 4 != 0).
--- All other worker/abort/range logic unchanged from Phase 4.
+-- Phase 5 + yescryptr16: worker uses Algo.Dispatch for all hash calls.
+-- Skein uses 4-way AVX2 batch; yescryptr16 uses 4x sequential.
 
 use Target
 use Header
-use Hash.Native
+use Algo.Dispatch
 
 ABORT_CHECK_INTERVAL : Nat
-ABORT_CHECK_INTERVAL = 1024   -- check abort every 1024 hashes (256 batches of 4)
+ABORT_CHECK_INTERVAL = 1024
 
 type AbortFlag = AbortFlag (IORef Boolean)
 
@@ -34,6 +33,7 @@ ResultRef.read (ResultRef ref) = IORef.read ref
 
 type WorkerCfg = {
   workerId   : Nat,
+  algo       : AlgoId,
   inputs     : HeaderInputs,
   target     : BigNat,
   nonceStart : Nat32,
@@ -43,29 +43,19 @@ type WorkerCfg = {
   hashCount  : IORef Nat
 }
 
--- -----------------------------------------------------------------------
--- Worker body: scan nonces in batches of 4 using AVX2 batch hash
--- -----------------------------------------------------------------------
-
 Worker.run : WorkerCfg -> '{IO} ()
-Worker.run cfg = do
-  go cfg.nonceStart 0
+Worker.run cfg = go cfg.nonceStart 0
   where
     go : Nat32 -> Nat -> '{IO} ()
     go nonce batch =
-      -- Abort check every ABORT_CHECK_INTERVAL hashes
       shouldAbort =
         if batch >= ABORT_CHECK_INTERVAL then do
           IORef.modify cfg.hashCount (Nat.+ ABORT_CHECK_INTERVAL)
           AbortFlag.check cfg.abort
         else pure false
-
       if shouldAbort then pure ()
-      else if nonce > cfg.nonceStop then do
-        IORef.modify cfg.hashCount (Nat.+ (Nat32.toNat (Nat32.- nonce cfg.nonceStart) `Nat.mod` ABORT_CHECK_INTERVAL))
-        pure ()
+      else if nonce > cfg.nonceStop then pure ()
       else
-        -- Batch of 4 (or fewer at end of range)
         let n0 = nonce
             n1 = Nat32.+ nonce 1
             n2 = Nat32.+ nonce 2
@@ -76,27 +66,21 @@ Worker.run cfg = do
               h1 = buildHeader { cfg.inputs | nonce = n1 }
               h2 = buildHeader { cfg.inputs | nonce = n2 }
               h3 = buildHeader { cfg.inputs | nonce = n3 }
-          (d0, d1, d2, d3) = Hash.Native.hash512_batch4 h0 h1 h2 h3
-          -- Check each lane
-          found = checkBatch4 cfg.target
-            [(n0,h0,d0),(n1,h1,d1),(n2,h2,d2),(n3,h3,d3)]
-          match found with
+          (d0, d1, d2, d3) = Algo.hashBatch4 cfg.algo h0 h1 h2 h3
+          match checkBatch4 cfg.target [(n0,h0,d0),(n1,h1,d1),(n2,h2,d2),(n3,h3,d3)] with
             Some (wn, wh) -> do
               ResultRef.write cfg.result wn wh
               AbortFlag.set cfg.abort
               pure ()
-            None ->
-              go (Nat32.+ nonce 4) (batch + 4)
-        else
-          -- Tail: single hashes for remaining nonces
+            None -> go (Nat32.+ nonce 4) (batch + 4)
+        else do
           let header = buildHeader { cfg.inputs | nonce = nonce }
-              digest = Hash.Native.hash512 header
+              digest = Algo.hashHeader cfg.algo header
           if Target.meetsTarget digest cfg.target then do
             ResultRef.write cfg.result nonce header
             AbortFlag.set cfg.abort
             pure ()
-          else
-            go (Nat32.+ nonce 1) (batch + 1)
+          else go (Nat32.+ nonce 1) (batch + 1)
 
 checkBatch4 : BigNat -> [(Nat32, Bytes, Bytes)] -> Optional (Nat32, Bytes)
 checkBatch4 target = cases
@@ -105,31 +89,27 @@ checkBatch4 target = cases
     if Target.meetsTarget d target then Some (n, h)
     else checkBatch4 target rest
 
--- -----------------------------------------------------------------------
--- Pool (unchanged from Phase 4)
--- -----------------------------------------------------------------------
-
 type ScanResult = {
   found       : Optional (Nat32, Bytes),
   totalHashes : Nat,
   aborted     : Boolean
 }
 
-Worker.scanJob : Nat -> HeaderInputs -> BigNat -> AbortFlag
+Worker.scanJob : Nat -> AlgoId -> HeaderInputs -> BigNat -> AbortFlag
              -> '{IO, Exception} ScanResult
-Worker.scanJob threadCount inputs target externalAbort = do
-  abort    = externalAbort
+Worker.scanJob threadCount algo inputs target externalAbort = do
   result   = ResultRef.new
   hashRefs = List.map (\_ -> IORef.new 0) (List.range 0 threadCount)
   ranges   = splitNonceRange threadCount
   threads  = List.zipWith3 (\(start, stop) hashRef i ->
     let cfg = {
           workerId   = i,
+          algo       = algo,
           inputs     = inputs,
           target     = target,
           nonceStart = start,
           nonceStop  = stop,
-          abort      = abort,
+          abort      = externalAbort,
           result     = result,
           hashCount  = hashRef
         }
@@ -138,7 +118,7 @@ Worker.scanJob threadCount inputs target externalAbort = do
   List.each threads Thread.await
   totalHashes = List.foldl (\acc ref -> acc + IORef.read ref) 0 hashRefs
   found       = ResultRef.read result
-  wasAborted  = AbortFlag.check abort
+  wasAborted  = AbortFlag.check externalAbort
   pure { found = found, totalHashes = totalHashes
        , aborted = wasAborted && Optional.isNone found }
 
