@@ -1,12 +1,9 @@
 /*
 ** Rake :: skein_bridge.c
-** Thin wrapper + self-test suite for Skein-512.
+** Skein-512 wrapper and self-test.
 **
-** rake_skein512_selftest() returns the number of failed vectors (0 = all pass).
-** It does NOT call abort() so the orchestrator can decide whether to proceed.
-**
-** Test vectors: Skein-1.3 Appendix B, Skein-512-512.
-** Each output_hex is exactly 128 hex characters (64 bytes). No mid-nibble splits.
+** KAT expected values stored as raw uint8_t arrays.
+** Source: Skein-1.3 Appendix B (https://www.schneier.com/academic/skein/)
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,10 +13,8 @@
 
 void rake_skein_version_assert(void) {
     if (RAKE_BRIDGE_VERSION != 1) {
-        fprintf(stderr,
-            "[rake] FATAL: skein_bridge version mismatch. "
-            "Expected 1, got %d. Recompile.\n",
-            RAKE_BRIDGE_VERSION);
+        fprintf(stderr, "[rake] FATAL: skein_bridge version mismatch %d\n",
+                RAKE_BRIDGE_VERSION);
         abort();
     }
 }
@@ -34,148 +29,111 @@ int rake_skein512(const uint8_t *in, size_t in_len, uint8_t *out) {
 
 int rake_skein512_batch(const uint8_t **inputs, const size_t *in_lens,
                         uint8_t **outputs, size_t count) {
-    size_t i;
-    int failures = 0;
-    for (i = 0; i < count; i++) {
-        if (rake_skein512(inputs[i], in_lens[i], outputs[i]) != 0)
-            failures++;
-    }
+    size_t i; int failures = 0;
+    for (i = 0; i < count; i++)
+        if (rake_skein512(inputs[i], in_lens[i], outputs[i]) != 0) failures++;
     return failures;
 }
 
-static int hex_nibble(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
+/* -----------------------------------------------------------------------
+ * KAT vectors: Skein-512-512, Appendix B
+ * All expected[] arrays are exactly 64 bytes.
+ * ----------------------------------------------------------------------- */
 
-static void hex_decode(const char *hex, uint8_t *out, size_t out_len) {
-    size_t i;
-    for (i = 0; i < out_len; i++)
-        out[i] = (uint8_t)((hex_nibble(hex[2*i]) << 4) | hex_nibble(hex[2*i+1]));
-}
-
-typedef struct {
-    const char *label;
-    const char *input_hex;
-    size_t      input_len;
-    const char *output_hex;  /* exactly 128 hex chars */
-} SkeinVector;
-
-/*
-** Skein-1.3 Appendix B official vectors.
-** Verified character counts: each output_hex = 128 chars = 64 bytes.
-**
-**   Vec 0: empty   -> bc5b4c50...72cba7a  (128 chars)
-**   Vec 1: ff      -> 71b7bce6...c3d8cff  (128 chars)
-**   Vec 2: 00..1f  -> 45863ba3...87662ff  (128 chars)
-**   Vec 3: 00..3f  -> 91cca510...a5adb7   (128 chars) -- note: 126 chars, pad to check
-**   Vec 4: 00..7f  -> 45863ba3...87662ff  (128 chars)
-*/
-static const SkeinVector VECTORS[] = {
-    {
-        "Skein-512-512, zero-length input",
-        "",
-        0,
-        "bc5b4c50925519c290cc634277ae3d62"
-        "57212395cba733bbad37a4af0fa06af4"
-        "1fca7903d06564fea7a2d3730dbdb80c"
-        "1f85562dfcc070334ea4d1d9e72cba7a"
-    },
-    {
-        "Skein-512-512, input=0xFF",
-        "ff",
-        1,
-        "71b7bce6fe6452227b9ced6014249e5b"
-        "f9a9754c3ad618ccc4e0aae16b316cc8"
-        "9ca3672a2612566de74b27977d4dfa1e"
-        "7c8d3f2b3bb3cce66bd37b5b7c3d8cff"
-    },
-    {
-        "Skein-512-512, input=0x00..0x1F",
-        "000102030405060708090a0b0c0d0e0f"
-        "101112131415161718191a1b1c1d1e1f",
-        32,
-        "45863ba3be0c4dfc27e75d358496f4ac"
-        "9a736a505d9313b42b2f5eada79fc17f"
-        "63861e947afb1d056aa199575ad3f8c9"
-        "a3cc1780b5e5fa4cae050e98987662ff"
-    },
-    {
-        "Skein-512-512, input=0x00..0x3F",
-        "000102030405060708090a0b0c0d0e0f"
-        "101112131415161718191a1b1c1d1e1f"
-        "202122232425262728292a2b2c2d2e2f"
-        "303132333435363738393a3b3c3d3e3f",
-        64,
-        "91cca510c263c4ddd010530a33073309"
-        "628631f308747e1bcbaa90e451cab92e"
-        "5188087af4188773a332303e6667a7a2"
-        "10856f742139000071f48e8ba2a5adb7"
-    },
-    {
-        "Skein-512-512, input=0x00..0x7F",
-        "000102030405060708090a0b0c0d0e0f"
-        "101112131415161718191a1b1c1d1e1f"
-        "202122232425262728292a2b2c2d2e2f"
-        "303132333435363738393a3b3c3d3e3f"
-        "404142434445464748494a4b4c4d4e4f"
-        "505152535455565758595a5b5c5d5e5f"
-        "606162636465666768696a6b6c6d6e6f"
-        "707172737475767778797a7b7c7d7e7f",
-        128,
-        "45863ba3be0c4dfc27e75d358496f4ac"
-        "9a736a505d9313b42b2f5eada79fc17f"
-        "63861e947afb1d056aa199575ad3f8c9"
-        "a3cc1780b5e5fa4cae050e98987662ff"
-    }
+static const uint8_t kat0_in[1]  = {0};   /* zero-length: use len=0 */
+static const uint8_t kat0_exp[64] = {
+    0xbc,0x5b,0x4c,0x50,0x92,0x55,0x19,0xc2,0x90,0xcc,0x63,0x42,0x77,0xae,0x3d,0x62,
+    0x57,0x21,0x23,0x95,0xcb,0xa7,0x33,0xbb,0xad,0x37,0xa4,0xaf,0x0f,0xa0,0x6a,0xf4,
+    0x1f,0xca,0x79,0x03,0xd0,0x65,0x64,0xfe,0xa7,0xa2,0xd3,0x73,0x0d,0xbd,0xb8,0x0c,
+    0x1f,0x85,0x56,0x2d,0xfc,0xc0,0x70,0x33,0x4e,0xa4,0xd1,0xd9,0xe7,0x2c,0xba,0x7a
 };
 
-#define VECTOR_COUNT (sizeof(VECTORS) / sizeof(VECTORS[0]))
+static const uint8_t kat1_in[1]  = {0xff};
+static const uint8_t kat1_exp[64] = {
+    0x71,0xb7,0xbc,0xe6,0xfe,0x64,0x52,0x22,0x7b,0x9c,0xed,0x60,0x14,0x24,0x9e,0x5b,
+    0xf9,0xa9,0x75,0x4c,0x3a,0xd6,0x18,0xcc,0xc4,0xe0,0xaa,0xe1,0x6b,0x31,0x6c,0xc8,
+    0x9c,0xa3,0x67,0x2a,0x26,0x12,0x56,0x6d,0xe7,0x4b,0x27,0x97,0x7d,0x4d,0xfa,0x1e,
+    0x7c,0x8d,0x3f,0x2b,0x3b,0xb3,0xcc,0xe6,0x6b,0xd3,0x7b,0x5b,0x7c,0x3d,0x8c,0xff
+};
 
-/*
-** Returns number of failed vectors (0 = all pass). Never calls abort().
-*/
+static const uint8_t kat2_in[32] = {
+    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f
+};
+static const uint8_t kat2_exp[64] = {
+    0x45,0x86,0x3b,0xa3,0xbe,0x0c,0x4d,0xfc,0x27,0xe7,0x5d,0x35,0x84,0x96,0xf4,0xac,
+    0x9a,0x73,0x6a,0x50,0x5d,0x93,0x13,0xb4,0x2b,0x2f,0x5e,0xad,0xa7,0x9f,0xc1,0x7f,
+    0x63,0x86,0x1e,0x94,0x7a,0xfb,0x1d,0x05,0x6a,0xa1,0x99,0x57,0x5a,0xd3,0xf8,0xc9,
+    0xa3,0xcc,0x17,0x80,0xb5,0xe5,0xfa,0x4c,0xae,0x05,0x0e,0x98,0x98,0x76,0x62,0xff
+};
+
+static const uint8_t kat3_in[64] = {
+    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,
+    0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e,0x2f,
+    0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x3a,0x3b,0x3c,0x3d,0x3e,0x3f
+};
+static const uint8_t kat3_exp[64] = {
+    0x91,0xcc,0xa5,0x10,0xc2,0x63,0xc4,0xdd,0xd0,0x10,0x53,0x0a,0x33,0x07,0x33,0x09,
+    0x62,0x86,0x31,0xf3,0x08,0x74,0x7e,0x1b,0xcb,0xaa,0x90,0xe4,0x51,0xca,0xb9,0x2e,
+    0x51,0x88,0x08,0x7a,0xf4,0x18,0x87,0x73,0xa3,0x32,0x30,0x3e,0x66,0x67,0xa7,0xa2,
+    0x10,0x85,0x6f,0x74,0x21,0x39,0x00,0x00,0x71,0xf4,0x8e,0x8b,0xa2,0xa5,0xad,0xb7
+};
+
+static const uint8_t kat4_in[128] = {
+    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+    0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,
+    0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e,0x2f,
+    0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x3a,0x3b,0x3c,0x3d,0x3e,0x3f,
+    0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4a,0x4b,0x4c,0x4d,0x4e,0x4f,
+    0x50,0x51,0x52,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x5b,0x5c,0x5d,0x5e,0x5f,
+    0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f,
+    0x70,0x71,0x72,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x7b,0x7c,0x7d,0x7e,0x7f
+};
+static const uint8_t kat4_exp[64] = {
+    0x45,0x86,0x3b,0xa3,0xbe,0x0c,0x4d,0xfc,0x27,0xe7,0x5d,0x35,0x84,0x96,0xf4,0xac,
+    0x9a,0x73,0x6a,0x50,0x5d,0x93,0x13,0xb4,0x2b,0x2f,0x5e,0xad,0xa7,0x9f,0xc1,0x7f,
+    0x63,0x86,0x1e,0x94,0x7a,0xfb,0x1d,0x05,0x6a,0xa1,0x99,0x57,0x5a,0xd3,0xf8,0xc9,
+    0xa3,0xcc,0x17,0x80,0xb5,0xe5,0xfa,0x4c,0xae,0x05,0x0e,0x98,0x98,0x76,0x62,0xff
+};
+
+typedef struct {
+    const char    *label;
+    const uint8_t *in;
+    size_t         in_len;
+    const uint8_t *exp;
+} KAT;
+
+static const KAT KATS[] = {
+    { "zero-length",   kat0_in,  0,   kat0_exp },
+    { "0xFF",          kat1_in,  1,   kat1_exp },
+    { "0x00..0x1F",    kat2_in,  32,  kat2_exp },
+    { "0x00..0x3F",    kat3_in,  64,  kat3_exp },
+    { "0x00..0x7F",    kat4_in,  128, kat4_exp },
+};
+#define NKATS (sizeof(KATS)/sizeof(KATS[0]))
+
+/* Returns number of failures (0 = all pass). Never aborts. */
 int rake_skein512_selftest(void) {
-    size_t i, j;
-    uint8_t input[256];
-    uint8_t actual[RAKE_SKEIN512_BYTES];
-    uint8_t expected[RAKE_SKEIN512_BYTES];
+    uint8_t actual[64];
     int failed = 0;
-
-    fprintf(stderr, "[rake] Running %zu Skein-1.3 512-bit self-test vectors...\n",
-            VECTOR_COUNT);
-
-    for (i = 0; i < VECTOR_COUNT; i++) {
-        const SkeinVector *v = &VECTORS[i];
-        memset(input, 0, sizeof(input));
-        if (v->input_len > 0)
-            hex_decode(v->input_hex, input, v->input_len);
-        hex_decode(v->output_hex, expected, RAKE_SKEIN512_BYTES);
-
-        if (rake_skein512(input, v->input_len, actual) != 0) {
-            fprintf(stderr, "[rake] Vector %zu: hash function error\n", i);
-            failed++;
-            continue;
+    fprintf(stderr, "[skein] Running %zu Skein-512 KAT vectors...\n", NKATS);
+    for (size_t i = 0; i < NKATS; i++) {
+        const KAT *k = &KATS[i];
+        if (rake_skein512(k->in, k->in_len, actual) != 0) {
+            fprintf(stderr, "[skein] Vector %zu: hash error\n", i); failed++; continue;
         }
-
-        if (memcmp(actual, expected, RAKE_SKEIN512_BYTES) != 0) {
-            fprintf(stderr, "[rake] Vector %zu FAILED: %s\n  Expected: ", i, v->label);
-            for (j = 0; j < RAKE_SKEIN512_BYTES; j++) fprintf(stderr, "%02x", expected[j]);
-            fprintf(stderr, "\n  Actual:   ");
-            for (j = 0; j < RAKE_SKEIN512_BYTES; j++) fprintf(stderr, "%02x", actual[j]);
+        if (memcmp(actual, k->exp, 64) != 0) {
+            fprintf(stderr, "[skein] FAIL vector %zu (%s)\n  exp: ", i, k->label);
+            for (int j=0;j<64;j++) fprintf(stderr,"%02x",k->exp[j]);
+            fprintf(stderr, "\n  got: ");
+            for (int j=0;j<64;j++) fprintf(stderr,"%02x",actual[j]);
             fprintf(stderr, "\n");
             failed++;
         } else {
-            fprintf(stderr, "[rake] Vector %zu OK: %s\n", i, v->label);
+            fprintf(stderr, "[skein] Vector %zu OK (%s)\n", i, k->label);
         }
     }
-
-    if (failed == 0)
-        fprintf(stderr, "[rake] All %zu Skein vectors passed.\n", VECTOR_COUNT);
-    else
-        fprintf(stderr, "[rake] %d/%zu Skein vectors FAILED.\n", failed, VECTOR_COUNT);
-
+    if (!failed) fprintf(stderr, "[skein] All %zu vectors passed.\n", NKATS);
     return failed;
 }
