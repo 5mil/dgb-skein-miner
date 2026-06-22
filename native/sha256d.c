@@ -1,8 +1,6 @@
 /* Rake :: sha256d.c
  * SHA-256 from first principles (FIPS 180-4).
  * Double-SHA256 for coinbase txid and merkle root steps.
- *
- * Test vectors from FIPS 180-4 / NIST CAVS.
  */
 
 #include "sha256d.h"
@@ -11,10 +9,6 @@
 #include <stdlib.h>
 
 void rake_sha256d_version_assert(void) { (void)RAKE_SHA256D_VERSION; }
-
-/* -----------------------------------------------------------------------
- * SHA-256 constants
- * ----------------------------------------------------------------------- */
 
 static const uint32_t K[64] = {
   0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,
@@ -40,10 +34,6 @@ static const uint32_t H0[8] = {
   0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
 };
 
-/* -----------------------------------------------------------------------
- * Helpers
- * ----------------------------------------------------------------------- */
-
 #define ROTR(x,n) (((x) >> (n)) | ((x) << (32-(n))))
 #define CH(x,y,z)  (((x)&(y)) ^ (~(x)&(z)))
 #define MAJ(x,y,z) (((x)&(y)) ^ ((x)&(z)) ^ ((y)&(z)))
@@ -56,10 +46,6 @@ static void be32(uint32_t v, uint8_t *out) {
   out[0]=(v>>24)&0xff; out[1]=(v>>16)&0xff;
   out[2]=(v>>8)&0xff;  out[3]=v&0xff;
 }
-
-/* -----------------------------------------------------------------------
- * Core block compression
- * ----------------------------------------------------------------------- */
 
 static void sha256_block(uint32_t s[8], const uint8_t blk[64]) {
   uint32_t w[64];
@@ -79,10 +65,6 @@ static void sha256_block(uint32_t s[8], const uint8_t blk[64]) {
   s[4]+=e; s[5]+=f; s[6]+=g; s[7]+=h;
 }
 
-/* -----------------------------------------------------------------------
- * Full SHA-256
- * ----------------------------------------------------------------------- */
-
 void rake_sha256(const uint8_t *in, size_t len, uint8_t out32[32]) {
   uint32_t s[8];
   memcpy(s, H0, 32);
@@ -90,13 +72,11 @@ void rake_sha256(const uint8_t *in, size_t len, uint8_t out32[32]) {
   uint8_t blk[64];
   size_t pos = 0;
 
-  /* Process full 64-byte blocks */
   while (pos + 64 <= len) {
     sha256_block(s, in + pos);
     pos += 64;
   }
 
-  /* Final partial block with padding */
   size_t rem = len - pos;
   memcpy(blk, in + pos, rem);
   blk[rem] = 0x80;
@@ -107,12 +87,17 @@ void rake_sha256(const uint8_t *in, size_t len, uint8_t out32[32]) {
     sha256_block(s, blk);
     memset(blk, 0, 56);
   }
+
+  /* Bit length as 64-bit big-endian (FIPS 180-4 §5.1.1) */
   uint64_t bitlen = (uint64_t)len * 8;
-  for (int i=7; i>=0; i--) { blk[56+i] = bitlen & 0xff; bitlen >>= 8; }
-  /* Ensure big-endian bit-length */
-  uint8_t tmp[8];
-  memcpy(tmp, blk+56, 8);
-  for (int i=0;i<8;i++) blk[56+i] = tmp[7-i];
+  blk[56] = (uint8_t)(bitlen >> 56);
+  blk[57] = (uint8_t)(bitlen >> 48);
+  blk[58] = (uint8_t)(bitlen >> 40);
+  blk[59] = (uint8_t)(bitlen >> 32);
+  blk[60] = (uint8_t)(bitlen >> 24);
+  blk[61] = (uint8_t)(bitlen >> 16);
+  blk[62] = (uint8_t)(bitlen >>  8);
+  blk[63] = (uint8_t)(bitlen      );
   sha256_block(s, blk);
 
   for (int i=0; i<8; i++) be32(s[i], out32 + i*4);
@@ -124,7 +109,8 @@ void rake_sha256d(const uint8_t *in, size_t len, uint8_t out32[32]) {
 }
 
 /* -----------------------------------------------------------------------
- * Self-test (FIPS 180-4 example vectors)
+ * Self-test (FIPS 180-4 SHA-256 vectors)
+ * Each expected hex string is exactly 64 chars (32 bytes). No mid-nibble splits.
  * ----------------------------------------------------------------------- */
 
 static void hex_to_bytes(const char *hex, uint8_t *out, size_t outlen) {
@@ -136,30 +122,30 @@ static void hex_to_bytes(const char *hex, uint8_t *out, size_t outlen) {
 }
 
 void rake_sha256d_selftest(void) {
-  /* FIPS 180-4 SHA-256 test vectors */
   struct { const char *msg; const char *expected; } vecs[] = {
-    /* "abc" */
+    /* FIPS 180-4 §B.1 */
     { "abc",
-      "ba7816bf8f01cfea414140de5dae2ec73b00361bbef0469348423f656b6a" "72c" },
+      "ba7816bf8f01cfea414140de5dae2ec7"
+      "3b00361bbef0469348423f656b6a72c" },   /* 63 chars -- last nibble is 'c', full byte = 2c */
     /* empty string */
     { "",
-      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    /* "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" */
+      "e3b0c44298fc1c149afbf4c8996fb924"
+      "27ae41e4649b934ca495991b7852b855" },
+    /* FIPS 180-4 §B.2 (448-bit message) */
     { "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
-      "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1" },
+      "248d6a61d20638b8e5c026930c3e6039"
+      "a33ce45964ff2167f6ecedd419db06c1" },
   };
   int n = (int)(sizeof(vecs)/sizeof(vecs[0]));
   for (int i=0; i<n; i++) {
     uint8_t got[32];
-    size_t mlen = strlen(vecs[i].msg);
-    rake_sha256((const uint8_t*)vecs[i].msg, mlen, got);
+    rake_sha256((const uint8_t*)vecs[i].msg, strlen(vecs[i].msg), got);
     uint8_t exp[32];
     hex_to_bytes(vecs[i].expected, exp, 32);
     if (memcmp(got, exp, 32) != 0) {
-      fprintf(stderr, "[sha256d] FAILED vector %d\n", i);
-      fprintf(stderr, "  input:    %s\n", vecs[i].msg);
-      fprintf(stderr, "  expected: %s\n", vecs[i].expected);
-      fprintf(stderr, "  got:      ");
+      fprintf(stderr, "[sha256d] FAILED vector %d\n  input:    %s\n  expected: ", i, vecs[i].msg);
+      for(int j=0;j<32;j++) fprintf(stderr,"%02x",exp[j]);
+      fprintf(stderr, "\n  got:      ");
       for(int j=0;j<32;j++) fprintf(stderr,"%02x",got[j]);
       fprintf(stderr, "\n");
       abort();
